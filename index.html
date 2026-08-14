@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1bit MONSTER</title>
+<meta name="description" content="1bit MONSTER — coming soon.">
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --fg: #f2f2f2;
+    --dim: #888888;
+    --accent: #f2f2f2;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'Courier New', Courier, monospace;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 24px;
+    background-image:
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.03) 0px, rgba(255,255,255,0.03) 1px, transparent 1px, transparent 3px);
+  }
+
+  main {
+    max-width: 640px;
+  }
+
+  .glyph {
+    font-size: 3.5rem;
+    line-height: 1;
+    margin-bottom: 1.5rem;
+    letter-spacing: 0.4rem;
+    filter: contrast(1) grayscale(1);
+  }
+
+  h1 {
+    font-size: clamp(1.8rem, 6vw, 3rem);
+    letter-spacing: 0.15em;
+    margin: 0 0 0.75rem;
+    text-transform: uppercase;
+  }
+
+  p.tagline {
+    color: var(--dim);
+    font-size: 0.95rem;
+    letter-spacing: 0.05em;
+    margin: 0 0 2.5rem;
+  }
+
+  .status {
+    display: inline-block;
+    border: 1px solid var(--fg);
+    padding: 0.5rem 1rem;
+    font-size: 0.75rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-bottom: 2.5rem;
+  }
+
+  .status::before {
+    content: "● ";
+  }
+
+  footer {
+    font-size: 0.7rem;
+    color: var(--dim);
+    letter-spacing: 0.1em;
+  }
+
+  a {
+    color: var(--fg);
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="glyph" aria-hidden="true">▚▞▚▞</div>
+  <h1>1bit MONSTER</h1>
+  <p class="tagline">everything is black, white, or about to change.</p>
+  <div class="status">signal incoming</div>
+  <footer>&copy; <span id="year"></span> 1bit MONSTER</footer>
+</main>
+<script>
+  document.getElementById('year').textContent = new Date().getFullYear();
+</script>
+</body>
+</html>
