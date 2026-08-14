@@ -1,0 +1,306 @@
+# Qwen3.6-35B-A3B on NPU — zaya_server integration notes
+
+_2026-07-31. Strix Halo (Ryzen AI MAX+ 395), FLM v0.9.46, official Q4_K_S weights
+from `FastFlowLM/Qwen3.6-35B-A3B-NPU2` (Hugging Face)._
+
+## Status
+
+**Works end-to-end:** `zaya_server --model Qwen3.6-35B-A3B-Q4_K_M.gguf` routes to the
+NPU via the FLM backend and returns clean generations ("Silver orb ascends, / Casting
+light upon the night, / Silent watcher high.").
+
+## Architecture (final)
+
+The NPU backend (`tests/backends/backend_npu.cpp`) spawns **`flm run <tag>` per
+request with FILE stdio** (no pipes):
+
+```
+zaya_server → NpuFlmBackend
+  → write prompt + "\n/bye\n" to /tmp/flm_in_<pid>.txt
+  → fork+exec: flm run qwen3.6-moe:35b-a3b  (stdin/out/err = regular files)
+  → poll /tmp/flm_out_<pid>.txt until transcript ends ">>> "
+  → parse text after "Model RAW Output:", strip "/bye" echo + ANSI codes
+  → kill child
+```
+
+Why files instead of pipes or HTTP — three FLM v0.9.46 bugs discovered:
+
+1. **fork+exec children with PIPE stdio hang on the NPU prefill kernel.**
+   Reproduced with a minimal C reproducer: child loads the model, prints
+   "[FLM] Prefill chunk 1/1", then blocks forever in `drm_syncobj_array_wait`.
+   Bash-spawned pipes work; dup2'd pipes hang; FILE stdio works ("2+2 equals 4"
+   verified). Root cause: amdxdna/XRT interaction with pipe fds in forked
+   children — not yet understood; workaround is file stdio.
+2. **`flm serve` mode degenerates into repeated-token loops ("plplpl").**
+   Same model/prompt via CLI answers correctly; via the HTTP server the model
+   emits "plplpl"/"ypeype" at ~63 t/s (5× NPU speed — bogus). Reproduced
+   standalone; not fixed by `--preemption 0/1`. Likely the "Multi-Backend KV
+   Cache" path in serve mode. Workaround: per-request CLI spawn.
+3. **the-rock HIP libs on LD_LIBRARY_PATH corrupt the FLM NPU runtime.**
+   With `/opt/rocm-therock/...` first in the env, the CLI also degenerates.
+   The backend sanitizes the child env to keep only FLM lib dirs.
+
+## Other fixes in this session
+
+- `flm_tag_for_model` (src/backend_npu_flm.cpp) + tests/backends/backend_npu.cpp:
+  Qwen3.6-35B-A3B (GGUF arch `qwen35moe`, 256 experts) now maps to
+  `qwen3.6-moe:35b-a3b` instead of the dense fallback `qwen3:4b`.
+- `tests/zaya_server.cpp` GGUF detection reads `expert_count` → `num_experts`.
+- Token shift scheme made collision-free: printable ASCII → +100 (132-226),
+  control/raw bytes → +300 (300-555). The old +200 scheme collided
+  ('e'-'~' → 201-226 overlapped control chars 1-26).
+- `npu_flm_set_prompt_text()` extern (NOT a virtual): adding a virtual to
+  `InferenceBackend` produced garbage vtable slots in the hipcc-compiled
+  adapter TUs (clang RTTI mismatch) → startup segfaults.
+- NPU FLM spawn waits for the HTTP port / transcript with the instance
+  timeout (300 s) — the 23 GB model load takes 60-90 s cold.
+- System HIP (`/usr/lib/.../libamdhip64.so.7.1.52801`, Ollama bundle) is
+  broken after a ROCm environment update; zaya_server must run with
+  `/opt/rocm-therock/.../_rocm_sdk_devel/lib` first on LD_LIBRARY_PATH.
+
+## Performance
+
+- Per-request model load ~11 s (warm page cache) + prefill + decode.
+- Measured decode on this stack: ~12 tok/s (see
+  `benchmarks/RESULTS-qwen3.6-35b-a3b-npu-flm-2026-07-30.md` for the full
+  `flm bench` sweep: 11.66 @1k → 8.82 @32k tok/s).
+- The 11 s/request spawn overhead is the price of FLM's CLI limitations; a
+  persistent-session protocol would need the pipe hang or serve degeneration
+  fixed upstream (both reproducible with stock FLM v0.9.46).
+
+## Still open
+
+- Native `npu_engine_universal` MoE path (no expert routing in the engine yet).
+- The FLM fork-pipe NPU hang and serve-mode degeneration (upstream bugs;
+  minimal reproducers in this session's evidence).
+
+## Q4NX byte-format state (for the native engine)
+
+Discovered via ground-truth correlation (GGUF dequant vs Q4NX bytes) + the
+`get_quantization_byte_size(m, dtype)` oracle (dlopen'd from
+libqwen3_6_moe_npu.so):
+
+- **BF16 tensors (e.g. moe_router) use a stride-8 row interleave**: the
+  logical matrix W[i][j] (i=in 0..2047, j=expert 0..255) is stored as
+  `flat[(i%8)*65536 + j*256 + i/8]` — rows split into 8 blocks by
+  `i mod 8`. Cracked and VALIDATED: router corr=1.000000 vs the GGUF F32
+  router, top-8 expert selection identical (152 131 101 115 42 218 127 173).
+  Tool: `tools/moe_router_test.cpp`. (Earlier "transposed" note was a
+  flatten-ordering illusion — the actual layout is the stride-8 interleave.)
+- **Expert FFN tensors (5120-byte rows, dtype 2/4, INT4)**: structure =
+  [512 B][512 B][4096 B packed] = [scales][mins][row-major nibbles], and the
+  1BP converter (`tools/gguf_to_onebp.cpp`, Q4NX branch) writes exactly this
+  layout: `value = q*scale + min`, scale=(max-min)/15, `qd[(rr*256+c)/2]` low
+  nibble = even col. The dequant value DISTRIBUTION matches the GGUF ground
+  truth (rms 0.0108 vs 0.0069 for the TQ2-quantized GGUF twin), but the value
+  POSITIONS still do not correlate with the GGUF under ~40 tested orderings
+  (row/col/group-major, stride-8 sub-blocks, expert permutations, scale/min
+  swaps, formula variants). Suspected cause: experts are interleaved in
+  8-expert NPU-dispatch blocks (FLM_SECRETS `parallel_size 16`,
+  `num_groups_per_row_parallel 2`). Next lead: capture the dequant_mm.xclbin
+  input/output on the NPU (gen_dequant_mm sequence) as the ground-truth
+  oracle, or brute-force expert-block interleavings (256! too big — but the
+  block structure constrains it).
+- **Attention projections (8704-byte rows) = Q8_0** (dtype 1, 1.0625 B/val =
+  34 B per 32 = INT8 + BF16 scale). Scales confirmed at bytes [0:512] (values
+  ~1.4e-4..6e-4). The INT8 value→position permutation is NOT yet cracked
+  (15+ layout hypotheses tested, all corr≈0; the dequant implementation is
+  binary-only in `dequant.lib`). Next lead: reverse the dequant.lib q80
+  routine, or use the dequant_mm.xclbin on the NPU as the dequant oracle.
+- The dtype oracle method (`/tmp/dtype_probe.c`): probe
+  `get_quantization_byte_size(8192, dtype)` — dtype 1 → 8704 B, dtype 2/4 →
+  5120 B, dtype 0 → 4608 B (0.5625 = INT4+FP16?), dtype 3/5 → 9216 B.
+
+## Native engine MoE roadmap (npu_engine_universal)
+
+1. ModelConfig: add MoE fields (N_EXPERTS, TOP_K, shared expert, ssm dims).
+2. CPU router: moe_router.weight is plain BF16 [2048, 256] — readable now.
+3. NPU expert FFN: the 5120-INT4 expert tensors dequantize with the existing
+   verified dequantizer; dispatch per-expert G/U/D via dequant_mm.xclbin
+   (FLM's gen_dequant_mm sequence, MIT).
+4. Attention: 30/40 layers are GatedDeltaNet (linear attention — CPU state
+   update, port from llama.cpp ggml gated_ln_net); 10/40 gated full attention
+   (attn.xclbin or GPU). This is the "NPU FFN ∥ GPU attention" pattern the
+   repo already pipelines (PR #1231).
+5. Q8_0 attention projections: needed for on-NPU attention; blocked on the
+   value permutation above.
+
+## Decisive next step: NPU-as-oracle harness (spec)
+
+The layout lives in the AIE kernel inside `dequant_mm.xclbin` (the
+"torch2aie chunk format" per `dequant_q4nx.cpp`'s own header). Every host-side
+permutation search has failed (~60 variants). The definitive oracle: run the
+kernel on the NPU and read back the dequantized output.
+
+Harness spec (all pieces are MIT and in-tree):
+
+1. **Kernel signature**: read `dequant_mm.xclbin`'s embedded metadata (xclbin
+   is a zip; kernel name + args are in the XML/JSON metadata) — the engine's
+   `npu_engine_universal.cpp` HybridFlmCtx shows the pattern for `mm.xclbin`
+   (args: bA, bW, bC). `dequant_mm` likely takes (data, scales, out) or a
+   single weight BO + dequantized out BO.
+2. **Instruction sequence**: dlopen `libqwen3_6_moe_npu.so` and call
+   `qwen3_6_moe_npu_sequence::gen_dequant_mm(npu_sequence*, M, K, N, off, m,
+   flm_dtype_t)` with dtype=1 (Q8_0) and dtype=2 (INT4) — `npu_sequence` is in
+   `third_party/FastFlowLM/src/include/npu_utils/npu_instr_utils.hpp`.
+   `get_quantization_byte_size` (already probed) confirms dtypes.
+3. **Submit**: XRT (`xrt::device(0)`, register the xclbin, one BO for the
+   raw 8704-B rows + one for the output) — same pattern as HybridFlmCtx.
+4. **Compare**: the read-back dequantized values vs the GGUF ground truth →
+   yields the exact value↔position mapping in one shot.
+5. Fallback if the sequence call is finicky: `_move_weights_q80` (same .so)
+   generates the weight-load path directly.
+
+Expected result: the layout mapping (likely a per-8/16-element DMA chunk
+interleave for the AIE array), unblocking BOTH the Q8_0 attention projections
+and the INT4 expert tensors, and thereby the native MoE engine's weight
+loader.
+
+### Harness status (2026-07-31, tools/dequant_oracle.cpp)
+
+BUILT AND RUNNING — kernel executes, output verified:
+
+- `Dequant::generate_dequant_q80_packed_in_q4nx_seq(seq, D_in, D_out, w_off,
+  mode)` (libdequant.so, MIT) generates the instruction stream; D_in must be
+  a multiple of the kernel's `desired_k_dequant` (D_in=2048 ✓).
+- The dequant.xclbin kernel (MLIR_AIE, 5 BOs + instr) executes with
+  opcode=3; the instruction stream's DDR_PATCH commands (0x81, word8=arg_idx,
+  word10=offset) reveal the BO usage: **arg0 = output region (16 patches,
+  512 KB stride, 8 MB total), arg1 = input region (17 patches, 320 KB
+  stride)**. The input must be in bo1 (leaving it empty = zeros out).
+- With a zeroed bo0: chunks 0-7 are fully written (f32, ~131k values each),
+  chunks 8-15 partial. The output values are real dequantized weights
+  (e.g. 4.48e-3, 2.8e-4, 3.09e-3) but written in an interleaved/strided
+  pattern over the BO (every 3rd f32 slot holds a sane value in the current
+  config) — the exact write pattern needs the WRITE_DMA BD stride decode
+  from the instruction stream (npu_dma_block_cmd fields in
+  npu_cmd_write_dma.hpp), which is the remaining step.
+- BD decode (instruction words 1077-1105): 8 XAIE_CONFIG_SHIMDMA_BD
+  descriptors at 64 KB address strides (0x0, 0x10000, ..., 0x70000) = 8 ×
+  64 KB DMA segments per 512 KB output chunk. 64 KB = 4 tiles of
+  [32×256] BF16 (16 KB each). The kernel's output write pattern is
+  BD-segment driven; the observed "every 3rd f32 slot" interleave in the
+  readback is consistent with the in-place output mode writing BF16 tiles
+  over the input BO.
+- The dtype oracle (get_quantization_byte_size) remains the format key:
+  dtype 1 = Q8_0 (8704-B rows), dtype 2/4 = INT4 (5120-B rows).
+
+### Session 2026-07-31 (post-reboot) — HARNESS BUG FOUND + REAL PATH IDENTIFIED
+
+**CRITICAL BUG in the harness**: `npu_sequence::dump()` returns the size in
+WORDS (`npu_seq.size()`), but tools/dequant_oracle.cpp treated it as BYTES:
+- BO allocated 1137 B, `memcpy` copied 4548 B (heap overflow), kernel got
+  size=1137 → only parsed the first ~2 rounds of the stream.
+- FIXED: `dsz = dsz_words * sizeof(uint32_t)` → full 4548-word (18192 B)
+  stream now executes.
+
+With the full stream (decoded with the exact op formats from
+npu_cmd_*.hpp):
+
+- **64 input windows** of 81920 B at 327680-B stride (17 rounds × 8 cols),
+  read as 32 × 2560-B chunks per window. Chunk = [512 B bf16 scales]
+  [2048 B q8]. The 17th round reads past the 17.8 MB tensor (BO must be
+  ≥ 20.7 MB).
+- **64 output windows** of 131072 B at 524288-B stride (8 rounds × 8 cols),
+  dense writes (D0 128 B @1, D1 128 @256, D2 2 @128 → even+odd granules).
+  Output span = **33.5 MB** — the 17.8 MB output BO was OVERRUN by the
+  kernel (→ the post-reboot segfaults; ctrl harness uses 34 MB BOs).
+- The old "chunks 8-15 partial" and "every 3rd f32 slot" observations were
+  ARTIFACTS of the truncated stream + reading byte pairs as bf16.
+
+**Controlled-oracle runs** (tools/dequant_oracle_ctrl.cpp, synthetic input:
+scales=1.0, q8 ramp 0..255):
+
+- Modes 0/1/2 all produce the SAME output: a **byte repacking into u16
+  pairs** — NOT dequant values. The "sane dequant values" (4.48e-3 …) in
+  the earlier session were the bf16 reinterpretation of raw q8 byte pairs
+  (numerical coincidence — e.g. pair (0x92,0x3b) = bf16 4.456e-3 ≈
+  13 × scale[1]). The kernel in this config is a data-mover/repacker.
+- Output pattern (first 256 B, unambiguous via the ramp): 16-B groups,
+  64-B sub-blocks at q8 bases 0/64/128/192; base positions {0,1,2,3,6,7,
+  10,11,14,15} carry input bytes, positions {4,5,8,9,12,13} carry
+  sign-bit-set q8 values from elsewhere (0x80|q8[63], 0x80|q8[16|64]…).
+- File layout confirmed: 2048 rows × 8704 B = [512 B scales][8192 B q8]
+  (row 1 scales at byte 8704 are sane bf16). Kernel windowing (2560-B
+  chunks) is NOT aligned to the 8704-B rows → most chunks contain
+  misaligned "scales".
+
+**REAL RUNTIME PATH IDENTIFIED**: the FLM model plugin
+(libqwen3_6_moe_npu.so) does NOT use the standalone dequant.xclbin +
+`generate_dequant_q80_packed_in_q4nx_seq`. It calls
+`qwen3_6_moe_npu_sequence::gen_dequant_mm(seq, M, K, N, off, m, dtype)` /
+`gen_dequant_mm_512` / `_move_weights_q80` against **dequant_mm.xclbin**
+(present in Qwen3.6-35B-A3B-NPU2/). Next step: drive gen_dequant_mm with
+real dims (M/K/N for the qkv tensor) and read back the dequant_mm kernel
+output — that is the true oracle for the value↔position mapping.
+
+### Session 2026-08-03 — dequant_mm oracle: harness RUNNING + I/O contract + strategic pivot
+
+**Harness built** (`tools/dequant_mm_oracle.cpp`, `tools/gguf_qkv_dump.cpp`). The
+decisive experiment from the doc above is now executable. Findings:
+
+- `gen_dequant_mm` (libqwen3_6_moe_npu.so) is `this`-free (verified by
+  disassembly — zero derefs of the incoming this in 2K instructions); it reads
+  only its args + .so globals (initialized at dlopen). Call it via dlopen with
+  a dummy this. `libq4_npu_eXpress.so` MUST be dlopen'd first (it defines
+  `SafeTensors`, which libqwen3_6_moe_npu.so imports).
+- ABI: `gen_dequant_mm(seq, M, K, N, off, m, dtype)` — rdi=this(unused),
+  rsi=seq, rdx=M, rcx=K, r8=N, r9=off, stack m, stack dtype (x86-64 SysV).
+  RTP config written: 0xf900 = K>>9, 0xf940 = m, 0xf980 = ~dtype&1,
+  0xf9c0 = (dtype>>1)&1. The 48-rtp_write prologue configures a 6×8 tile array.
+- `dequant_mm.xclbin` kernel `MLIR_AIE` (DPU): args opcode/instr/ninstr +
+  bo0..bo4 (HOST DRAM, 64 MB region); instr → SRAM (48 MB). opcode=3 run.
+- I/O contract (2048×8192 Q8_0 qkv): 2048 DDR_PATCH commands; output = arg0
+  (bo0), 33.5 MB write span; inputs = arg1 (bo1, ~7.3-8.1 MB) + arg2 (bo2,
+  ~15.6-17.5 MB). `off` shifts the input read window.
+- **Kernel output is INT8-saturated, data-independent-ish**: with a synthetic
+  ramp (scales=1.0), output = only {129, 127, 255} (int8 -127/+127/-1) in a
+  period-128 pattern; with real qkv, 99% of output bytes are the same three
+  values. It is NOT a value-preserving dequant in this config — it repacks to
+  an INT8 tile form with clamping (scales handled separately, as the engine's
+  own host-side path does). Cracking the exact repack further is a dead end
+  for the native engine (below).
+
+**STRATEGIC PIVOT — the oracle was the wrong gate.** The native engine does
+NOT need FLM's binary layout: its weight path is already
+`Q4NX tiles → dequant_i8_to_float_ex (in-tree, verified) → transpose_pack →
+packB INT8 requant → mm.xclbin` (engine lines ~886-906). That pipeline is
+self-consistent with the in-tree converter (`gguf_to_onebp.cpp`, which already
+detects MoE ndim==3 tensors). The layout oracle only mattered for reusing
+FLM's precompiled INT4 xclbins — an optimization, not a blocker.
+
+**Qwen3.6-35B-A3B geometry (resolved, from official model.q4nx header +
+GGUF):**
+
+| Tensor (per layer) | Q4NX shape | Logical |
+|---|---|---|
+| linear_attn.qkv_proj | [256, 8, 8704] I8 | Q8_0, 2048 rows × 8192 (qkv [8192, 2048], NH=32, NKV=16, HD=128) |
+| linear_attn.ssm_out_proj | [64, 16, 8704] I8 | Q8_0, 1024 rows × 8192 ([4096, 2048]) |
+| self_attn.gate_proj | [128, 8, 8704] I8 | Q8_0, 1024 rows ([4096, 2048]) — 10 full-attn layers |
+| mlp.gate_exps_proj / up_exps | [4096, 8, 5120] I8 | INT4, 32768 tile rows → 256 experts × [512, 2048] |
+| mlp.down_exps_proj | [16384, 2, 5120] I8 | INT4 → 256 experts × [2048, 512] |
+| mlp.share_*_exps_proj | [16/64, 8, 8704] I8 | Q8_0 — 1 shared expert [512, 2048]/[2048, 512] |
+| moe_router | [2048, 256] BF16 | stride-8 interleave (cracked, corr=1.0 — see §Q4NX byte-format) |
+| shared_expert_gate | [2048] BF16 | |
+| ssm_a / ssm_dt.bias / ssm_alpha_proj / ssm_beta_proj / ssm_conv1d / ssm_norm | BF16/F32 | GatedDeltaNet params |
+
+3-D shape semantics: [experts × tile_rows, col_blocks, tile_bytes], where
+col_blocks = ceil(in_features/256) — the "8" is 2048/256. Per-expert FFN
+intermediate = 512 (8 active × 512 = 4096 effective). GGUF names:
+`blk.N.attn_qkv`, `blk.N.ffn_gate_exps/up_exps/down_exps`, `blk.N.ffn_gate_inp`,
+`blk.N.ffn_gate_shexp`, `blk.N.ffn_gate_inp_shexp`.
+
+**Native engine MoE roadmap (updated):**
+1. ModelConfig: N_EXPERTS, TOP_K=8, IM_EXP=512, shared-expert flag + Q4NX
+   header parse (expert tensor offsets per layer; router offset).
+2. CPU router: de-interleave BF16 router (documented mapping), softmax top-8.
+3. Expert FFN on existing I8Ctx/HybridFlmCtx: packB each expert's G/U/D
+   (dims = dense GU/D shapes with IM=512) into per-expert BO slices; decode
+   loop: for each active expert → GU GEMM → SiLU → D GEMM → accumulate × weight.
+   Shared expert (Q8_0) always active.
+4. GatedDeltaNet attention (30/40 layers): port ggml_gated_delta_net from
+   in-tree llama.cpp ggml-cpu (ops.cpp, `ggml_compute_forward_gated_delta_net_
+   one_chunk`, MIT) + conv1d/gate from the Qwen3.6 HF reference; 10/40 full-attn
+   layers keep the existing attn_omp path.
+5. Converter: emit expert tensors via the existing Q4NX branch (already MoE
+   aware); router BF16 pass-through.

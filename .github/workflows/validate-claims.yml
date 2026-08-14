@@ -1,0 +1,177 @@
+name: Validate claims
+
+# Intent: re-measure every published number on real gfx1151 hardware daily and
+# fail (opening an issue) if a claim drifts beyond tolerance.
+#
+# STATUS: the re-measurement drivers (tools/validate_claims.py, tools/gen_numbers.py)
+# have been retired and the self-hosted strix-halo runner was removed, so this
+# workflow only enforces that benchmarks/latest.json is internally consistent
+# (every published key has a validator entry) - it does NOT re-measure on
+# hardware. Do not cite this workflow as proof that published numbers are
+# continuously verified. Re-measure manually on the box:
+#   python3 tools/validate_claims.py --build-dir 1bit/build --repeat 3 --warmup 1
+
+on:
+  schedule:
+    - cron: "17 4 * * *"   # 04:17 UTC daily
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Runs per benchmark (median is used)"
+        default: "3"
+  pull_request:
+    paths:
+      - "benchmarks/latest.json"
+      - "site/numbers.json"
+      - "tools/gen_numbers.py"
+      - "tools/validate_claims.py"
+      - "engine/fusion/**"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: validate-claims
+  cancel-in-progress: false
+
+jobs:
+  # Runs anywhere: proves numbers.json is exactly what the generator produces
+  # and that no unvalidated key is published. No hardware required.
+  consistency:
+    name: numbers.json is generated, not hand-edited
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Every published claim has a validator
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("benchmarks/latest.json"))
+          published = set(d["benchmarks"])
+          validated = set(sum((c["keys"] for c in d["_verify"]["commands"].values()), []))
+          orphans = sorted(published - validated)
+          if orphans:
+              print("FAIL: published but never re-measured:", orphans)
+              sys.exit(1)
+          print(f"ok: all {len(published)} published claims have a validator")
+          PY
+
+      - name: README benchmark statuses match _unverified
+        run: |
+          # README.md must not stamp a tok/s figure as measured/validated/
+          # reported for an engine that benchmarks/latest.json has quarantined
+          # in _unverified. Hardware-free. (issues #185, #190)
+          if [ -f tools/validate_claims.py ]; then
+            python3 tools/validate_claims.py --check-readme
+          else
+            echo "::notice::tools/validate_claims.py not present (pure-C++ repo) — skipping README claim check."
+          fi
+
+      - name: Badge files match benchmarks.json
+        # The badge generator in .github/workflows/update-badges.yml reads
+        # site/benchmarks.json and writes site/badge_*.json. If they drift
+        # (e.g. the prefill badge was hand-edited to 42.2 while the generator
+        # reads prefill_i8.tok_s which is 0), the badge wouldn't match what a
+        # fresh generation produces. Re-run the offline badge logic here and
+        # fail if the committed files differ (issue #238).
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          with open('site/benchmarks.json') as f:
+              bm = json.load(f)
+          engines = bm.get('engines', {})
+
+          expected = {
+              'badge_gpu.json': {
+                  'message': f"{engines.get('q1_gemv', {}).get('tok_s', '?')} tok/s",
+              },
+              'badge_npu.json': {
+                  'message': f"{engines.get('npu_v12', {}).get('tok_s', '?')} tok/s",
+              },
+              'badge_prefill.json': {
+                  'message': f"{engines.get('prefill_i8', {}).get('tflops') or bm.get('system', {}).get('tflops_int8', '?')} TFLOPS",
+              },
+          }
+
+          fail = 0
+          for fname, want in expected.items():
+              got = json.load(open(f'site/{fname}'))
+              if got.get('message') != want['message']:
+                  print(f"FAIL: {fname} says '{got.get('message')}' but generator produces '{want['message']}'")
+                  fail = 1
+              else:
+                  print(f"ok: {fname} → '{want['message']}'")
+          sys.exit(fail)
+          PY
+
+      - name: Retired claims must not reappear on the site
+        run: |
+          set -e
+          # nullglob: site/*-badge.json expands to nothing (not the literal
+          # pattern) once no hyphenated badge files remain, so the `cat`
+          # below doesn't hard-fail on a nonexistent literal filename.
+          shopt -s nullglob
+          # Numbers deliberately quarantined in benchmarks/latest.json _unverified.
+          # Match digits and unit even when separated by nested HTML tags, and
+          # scan the RENDERED text of index.html plus the JSON payloads the page
+          # fetches at runtime (numbers.json + all *-badge.json). The old check
+          # grepped raw index.html only, so `291<span>tok/s` slipped past it
+          # (issue #107). Patterns are matched against tag-stripped text.
+          banned='291 *tok/s|94 *tok/s|307 *tok/s|383 *tok/s|55\.7 *TFLOPS|437 *KB'
+          fail=0
+          # (1) Present-as-current-fact surfaces: index.html rendered text +
+          #     the JSON payloads the page fetches. These must be CLEAN.
+          {
+            sed 's/<[^>]*>//g' site/index.html
+            cat site/numbers.json site/*-badge.json 2>/dev/null
+          } > /tmp/site_fact.txt
+          if grep -nEo "$banned" /tmp/site_fact.txt; then
+            echo "FAIL: a quarantined claim reappeared on index.html / numbers.json / a badge (benchmarks/latest.json _unverified)"
+            fail=1
+          fi
+          # (2) Dated blog posts may reference a historical number, but only if
+          #     they carry a correction banner (the pattern the DSpark post
+          #     uses). Any post that cites a quarantined number without the
+          #     word "Correction" fails.
+          for f in site/blog/*.html; do
+            [ -f "$f" ] || continue
+            if sed 's/<[^>]*>//g' "$f" | grep -qEo "$banned"; then
+              if ! grep -qi 'Correction' "$f"; then
+                echo "FAIL: $f cites a quarantined number but has no correction banner (issue #107)"
+                fail=1
+              fi
+            fi
+          done
+          # (3) Blog SEO/social meta tags (content="...") are what crawlers and
+          #     link-previews render. A human-facing "Correction" banner does
+          #     NOT clean these, so a quarantined number in a meta tag fails
+          #     regardless of any banner. (issue #190)
+          for f in site/blog/*.html; do
+            [ -f "$f" ] || continue
+            meta_hits=$(grep -oE 'content="[^"]*"' "$f" | grep -Eo "$banned" | sort -u)
+            if [ -n "$meta_hits" ]; then
+              echo "FAIL: $f meta/og/twitter tags cite a quarantined number to crawlers (a Correction banner does not cover meta tags): $meta_hits"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "ok: index/JSON clean; every blog post citing a historical number carries a correction banner"
+          exit $fail
+
+      - name: site/numbers.json matches the generator
+        run: |
+          # decode/tui are absent on this runner, so they must be null either way.
+          if [ -f tools/gen_numbers.py ]; then
+            python3 tools/gen_numbers.py --check || {
+              echo "::error::site/numbers.json is stale. Run: python3 tools/gen_numbers.py"
+              exit 1
+            }
+          else
+            echo "::notice::tools/gen_numbers.py not present (pure-C++ repo) — skipping numbers.json check."
+          fi

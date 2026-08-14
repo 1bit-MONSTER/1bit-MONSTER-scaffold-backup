@@ -1,0 +1,36 @@
+# Binary files — mark as binary to prevent git from attempting text diffs
+*.q4nx binary
+*.h1b binary
+*.gguf binary
+*.safetensors binary
+*.bin binary
+*.xclbin binary
+*.o binary diff=-delta
+*.a binary diff=-delta
+*.so binary diff=-delta
+*.so.* binary diff=-delta
+*.ko binary diff=-delta
+*.ko.zst binary diff=-delta
+*.pnj binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.spv binary
+*.zst binary
+*.zip binary
+*.tar.gz binary
+
+# ── GitHub linguist: keep the language bar accurate ──
+# GPU compute shaders are compiled to SPIR-V at build time (glslc), loaded as data
+*.comp        linguist-vendored
+*.glsl        linguist-vendored
+*.spv         linguist-vendored binary
+
+# HIP kernels are C++ with HIP attributes, compiled by HIPCC
+*.hip         linguist-language=C++

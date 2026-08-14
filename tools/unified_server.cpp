@@ -1,0 +1,2536 @@
+// unified_server.cpp — One binary, all backends, auto-failover.
+// Replaces tests/zaya_server.cpp by wiring BackendManager into an HTTP server.
+// Smoke test trigger: PR #1219 model download + fixed assertions.
+// Auto-detects NPU, GPU (HIP/Vulkan), and CPU backends, picks the fastest,
+// and transparently failsover on error — zero config, one binary.
+//
+// Build: cmake --build . --target unified_server -j8
+// Run:   ./build/unified_server [--port 8088] [--weights /tmp/zaya_weights]
+//
+// API (OpenAI-compatible):
+//   GET  /v1/health           — Backend status & metrics dashboard
+//   GET  /v1/models           — Available model(s)
+//   POST /v1/chat/completions — Generate with auto-selected best backend
+//   POST /v1/completions      — Legacy completion endpoint
+//   POST /v1/backend/select   — Manually select a specific backend
+//   GET  /v1/backend/status   — Full backend manager report
+//
+// Headers (optional):
+//   X-Backend: hip_gpu | npu_xrt | vulkan_gpu | cpu_avx512 | cpu_scalar | auto
+//   X-Strategy: fastest | lowest_power | manual | round_robin
+
+#include "backend_manager.h"
+#include "npu_flm_delta.h"
+#include "backend_monitor.h"
+#include "backend_plugin.h"
+#include "backend.h"
+#include "backend_ggml_vulkan.h"
+#include "unified_pool.h"
+#include "batch_scheduler.h"
+#include "model_discovery.h"
+#include "model_router.h"
+#include "gguf_reader.h"
+#include "simple_tokenizer.h"
+#include "vl_processor.h"
+#include "vision_encoder.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
+#include <string>
+#include <vector>
+#include <deque>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include <mutex>
+#include <algorithm>
+#include <filesystem>
+#include <signal.h>
+#ifndef _MSC_VER
+#include <dirent.h>
+#else
+#include <filesystem>
+#endif
+#ifdef _WIN32
+// Minimal getopt for Windows — MSVC doesn't ship it
+#include <io.h>
+#include <string.h>
+static int optind = 1; static int opterr = 1; static const char* optarg = nullptr;
+struct option { const char* name; int has_arg; int* flag; int val; };
+enum { no_argument = 0, required_argument = 1, optional_argument = 2 };
+static int getopt_long(int argc, char* const argv[], const char* optstring, const struct option* longopts, int* longindex) {
+    if (optind >= argc || argv[optind][0] != '-') return -1;
+    if (argv[optind][1] == '-' && longopts) {
+        // Long option
+        for (int i = 0; longopts[i].name; i++) {
+            if (strcmp(argv[optind]+2, longopts[i].name) == 0) {
+                if (longindex) *longindex = i;
+                optind++;
+                if (longopts[i].has_arg == required_argument) {
+                    optarg = (optind < argc) ? argv[optind++] : nullptr;
+                }
+                if (longopts[i].flag) { *longopts[i].flag = longopts[i].val; return 0; }
+                return longopts[i].val;
+            }
+        }
+        return '?';
+    }
+    // Short option
+    int opt = argv[optind][1];
+    const char* p = optstring ? strchr(optstring, opt) : nullptr;
+    if (!p) return '?';
+    if (p[1] == ':') {
+        optarg = (optind + 1 < argc) ? argv[optind+1] : nullptr;
+        optind += (optarg ? 2 : 1);
+    } else {
+        optind++;
+    }
+    return opt;
+}
+#else
+#include <getopt.h>
+#endif
+#include <fstream>
+#include <fcntl.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#else
+#include <io.h>
+#include <process.h>
+#include <sys/stat.h>
+#define getpid _getpid
+#define close _close
+#define unlink _unlink
+// Use wrappers instead of macros to avoid clashing with std::ifstream::read
+static inline int read(int fd, void* buf, unsigned int count) { return (int)_read(fd, buf, count); }
+#endif
+
+#include "strategy_engine.h"
+#include "agent_watchdog.h"
+
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
+// ── Globals ──
+static std::atomic<bool> keep_running{true};
+// Vision (issue #1420): optional --mmproj for real ViT embeddings in chat.
+static VisionWeights g_vit;
+static bool g_vit_ok = false;
+static std::string g_mmproj_path;
+static std::string g_weights_dir = []() -> std::string {
+    const char* env = getenv("ZAYA_WEIGHTS_DIR");
+    if (env && env[0]) { std::string s(env); if (s.back()!='/') s+='/'; return s; }
+    const char* xdg = getenv("XDG_DATA_HOME");
+    if (xdg && xdg[0]) return std::string(xdg) + "/1bit-systems/weights/";
+    const char* home = getenv("HOME");
+    if (home && home[0]) return std::string(home) + "/.local/share/1bit-systems/weights/";
+    return "/tmp/zaya_weights/";
+}();
+static int g_port = 8088;
+
+// ── Speculative decode (--draft-model / --spec-decode) ──
+static Backend* g_draft_backend = nullptr;      // second, small model (ggml-vulkan)
+static std::string g_draft_model_path;          // GGUF path for the draft
+static bool g_spec_decode = false;              // master switch
+static int g_spec_n_draft = 4;                  // draft proposals per round
+
+// ── Unified model pool (--pool): all models resident, one control plane ──
+static UnifiedModelPool g_pool;
+static bool g_pool_enabled = false;
+
+// Protect global state accessed from HTTP handler threads (fixes #364)
+static std::mutex g_strategy_mutex;   // protects g_strategy_engine + g_watchdog
+static std::mutex g_config_mutex;     // protects current_cfg, g_tokenizer, model switching
+
+// Serializes ALL access to the single shared BackendManager compute context —
+// the actual decode (mgr.reset/generate), model reload (mgr.init), and
+// active-backend switch (mgr.select_backend/set_strategy). A BackendManager
+// holds one mutable inference state (KV cache + active-backend pointer); two
+// requests decoding concurrently corrupt it (AUDIT_ISSUES.md #2). This is the
+// OUTERMOST lock: g_config_mutex / g_strategy_mutex may be acquired while it is
+// held, but g_inference_mutex must never be acquired while holding either of
+// those, or the two orders can deadlock.
+// Generation timeout: abort in-flight generate_completion() if it exceeds
+// this wall-clock limit. Prevents a single slow/memory-hungry request from
+// holding g_inference_mutex indefinitely and OOM-killing the entire server
+// (issue #948). Configurable via CLI --gen-timeout-ms or GEN_TIMEOUT_MS env.
+// Default: 600000ms = 10 minutes. 0 = no timeout.
+static int g_generation_timeout_ms = []() -> int {
+    const char* env = getenv("GEN_TIMEOUT_MS");
+    if (env && env[0]) {
+        int v = atoi(env);
+        if (v >= 0) return v;
+    }
+    return 600000;  // 10 minutes default
+}();
+
+static std::mutex g_inference_mutex;
+static int g_batch_slots = 1;
+static std::unique_ptr<BatchScheduler> g_batch_scheduler;
+
+// ── FLM text-level session state (multi-turn KV reuse) ──
+// One live session owns the FLM subprocess's device-resident KV cache
+// (generate_completion is serialized by g_inference_mutex; the mutex here
+// also covers backend benchmark paths that call the FLM REPL directly).
+// Requests continuing the live session send only the delta; anything else
+// resets the session (full re-prefill).
+static std::mutex g_flm_session_mutex;
+static std::string g_flm_session_id;    // session owning the live FLM context
+static std::string g_flm_session_last;  // last full prompt sent to it
+
+// ── Strategy engine + agent watchdog (global for HTTP handler access) ──
+static StrategyEngine g_strategy_engine;
+static AgentWatchdog* g_watchdog = nullptr;
+
+// ── Tokenizer: uses RCPP BPE tokenizer (.htok) when available, falls back
+// to SimpleTokenizer (ASCII + UTF-8 byte passthrough) when not.
+// The RCPP tokenizer is linked via librocm_cpp and reads .htok binary format.
+// SimpleTokenizer itself lives in include/simple_tokenizer.h; g_tokenizer is
+// defined once in src/simple_tokenizer.cpp (part of backend_manager) so any
+// backend that needs it (e.g. FlmBackend) can link against the same instance.
+
+// ── Signal handler ──
+static void handle_sigint(int) {
+    keep_running = false;
+}
+
+// ── Helpers ──
+static std::string tokenizer_path() {
+    // Prefer .htok (BPE tokenizer from RCPP). Fall back to tokenizer.json for diagnostics.
+    std::string htok = g_weights_dir + "/tokenizer.htok";
+    std::ifstream f(htok, std::ios::binary);
+    if (f.good()) return htok;
+    return g_weights_dir + "/tokenizer.json";
+}
+
+// Per-model tokenizer: try the model's own GGUF vocab, else borrow one from
+// a sibling GGUF (e.g. Qwen3-0.6B.1bp next to Qwen3-0.6B.Q4_K_M.gguf). The
+// global tokenizer.htok is a Llama-era v1 file whose merge ids sit outside
+// the vocab the current reader accepts, so without this .1bp models decode
+// as garbage [id][id] through the ASCII fallback.
+static void load_model_tokenizer(const std::string& model_path) {
+    if (g_tokenizer.load_from_gguf(model_path)) return;
+    // NOTE: no early return for .gguf paths — load_from_gguf needs the ZINC
+    // lib (usually absent → ZINC_DISABLED), so even real GGUFs must fall
+    // through to .htok synthesis below, or the server decodes their output
+    // as ASCII garbage.
+    auto exists = [](const std::string& p) {
+        std::ifstream f(p, std::ios::binary);
+        return f.good();
+    };
+    // Synthesize a fresh .htok from the sibling GGUF and load it via the
+    // rcpp BPE path — load_from_gguf needs the ZINC lib (usually absent) and
+    // models/tokenizer.htok is a stale Llama-era v1 file. Cache next to the
+    // model so restart is cheap; regenerate when the GGUF changes.
+    auto load_or_synthesize = [&](const std::string& gguf) -> bool {
+        if (g_tokenizer.load_from_gguf(gguf)) return true;
+        std::string htok = gguf + ".htok";
+        bool need = true;
+        if (exists(htok)) {
+            struct stat a, b;
+            if (stat(gguf.c_str(), &a) == 0 && stat(htok.c_str(), &b) == 0)
+                need = b.st_mtime < a.st_mtime;
+            // Regenerate stale-format caches: v2 files written before the
+            // BOS/EOS-specials fix carry 0 specials and silently mangle chat
+            // templates. A cached file is stale if its version < HTOK_V3.
+            if (!need) {
+                std::ifstream hf(htok, std::ios::binary);
+                char magic[4];
+                uint32_t ver = 0;
+                if (hf.read(magic, 4) && std::memcmp(magic, "HTOK", 4) == 0 &&
+                    hf.read(reinterpret_cast<char*>(&ver), 4))
+                    need = ver < 3;
+            }
+        }
+        if (need) {
+            GgufReader r;
+            if (!r.open(gguf)) return false;
+            if (!r.write_htok(htok)) return false;
+        }
+        return g_tokenizer.load(htok);
+    };
+    std::vector<std::string> cands;
+    for (const char* suf : {".gguf", ".Q4_K_M.gguf", ".Q8_0.gguf", ".BF16.gguf"})
+        cands.push_back(model_path + suf);
+    auto dot = model_path.find_last_of('.');
+    std::string base = (dot != std::string::npos) ? model_path.substr(0, dot) : model_path;
+    for (const char* suf : {".Q4_K_M.gguf", ".Q8_0.gguf", ".BF16.gguf", ".gguf"})
+        cands.push_back(base + suf);
+    for (const auto& c : cands)
+        if (exists(c) && load_or_synthesize(c)) return;
+
+    // Quantized 1BP files carry the quant in their name (Qwen3-0.6B-q8-q4nx
+    // or Qwen3-0.6B.E4M3-IM) while the sibling GGUF keeps the plain base
+    // (Qwen3-0.6B.Q4_K_M.gguf) — strip known quant markers and retry, then
+    // fall back to scanning the directory for a GGUF sharing the base name.
+    for (const char* marker : {"-q8-q4nx", "-q4nx", ".E4M3", "-E4M3", "-IM", ".TQ2", "-TQ2"}) {
+        auto pos = base.rfind(marker);
+        if (pos == std::string::npos) continue;
+        std::string stripped = base.substr(0, pos);
+        for (const char* suf : {".Q4_K_M.gguf", ".Q8_0.gguf", ".BF16.gguf", ".gguf"}) {
+            std::string c = stripped + suf;
+            if (exists(c) && load_or_synthesize(c)) return;
+        }
+    }
+    // Directory scan: a GGUF whose stem equals our (quant-stripped) base.
+    std::string gguf_base = base;
+    for (const char* marker : {"-q8-q4nx", "-q4nx", ".E4M3", "-E4M3", "-IM", ".TQ2", "-TQ2"}) {
+        auto pos = gguf_base.rfind(marker);
+        if (pos != std::string::npos) gguf_base = gguf_base.substr(0, pos);
+    }
+    auto slash = model_path.find_last_of('/');
+    std::string dir = (slash != std::string::npos) ? model_path.substr(0, slash + 1) : "";
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir.empty() ? "." : dir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        std::string n = entry.path().filename().string();
+        if (n.size() < 6 || n.substr(n.size() - 5) != ".gguf") continue;
+        std::string stem = n.substr(0, n.size() - 5);
+        // Qwen3-0.6B.Q4_K_M → Qwen3-0.6B
+        auto q = stem.find(".Q4_K");
+        if (q != std::string::npos) stem = stem.substr(0, q);
+        auto q8 = stem.find(".Q8_0");
+        if (q8 != std::string::npos) stem = stem.substr(0, q8);
+        if (stem == gguf_base) {
+            std::string c = dir + n;
+            if (load_or_synthesize(c)) return;
+        }
+    }
+}
+
+static ModelConfig default_model_config() {
+    ModelConfig cfg;
+    cfg.hidden = 2048;
+    cfg.n_heads = 8;
+    cfg.n_kv_heads = 2;
+    cfg.head_dim = 128;
+    cfg.n_layers = 40;
+    cfg.n_experts = 16;
+    cfg.n_ff = 2048;
+    cfg.vocab = 262272;
+    cfg.router_hidden = 256;
+    cfg.qkv_dim = 1280;
+    return cfg;
+}
+
+// ── Resolve backend ID from header or query param ──
+static std::string resolve_backend_id(const httplib::Request& req) {
+    // Check header first, then query param
+    if (req.has_header("X-Backend"))
+        return req.get_header_value("X-Backend");
+    if (req.has_param("backend"))
+        return req.get_param_value("backend");
+    return "auto";
+}
+
+static SelectionStrategy resolve_strategy(const httplib::Request& req) {
+    std::string s;
+    if (req.has_header("X-Strategy"))
+        s = req.get_header_value("X-Strategy");
+    else if (req.has_param("strategy"))
+        s = req.get_param_value("strategy");
+
+    if (s == "lowest_power") return SelectionStrategy::LOWEST_POWER;
+    if (s == "manual")       return SelectionStrategy::MANUAL;
+    if (s == "round_robin")  return SelectionStrategy::ROUND_ROBIN;
+    return SelectionStrategy::FASTEST;  // default
+}
+
+// ── Resolve strategy engine name from header or query param ──
+static std::string resolve_strategy_name(const httplib::Request& req) {
+    if (req.has_header("X-Router-Strategy"))
+        return req.get_header_value("X-Router-Strategy");
+    if (req.has_param("strategy"))
+        return req.get_param_value("strategy");
+    return "";  // use default
+}
+
+// ── Build model info JSON ──
+static json model_info_json(const BackendInfo* active, const std::string& model_name = "unknown") {
+    json j;
+    j["id"] = model_name;
+    j["object"] = "model";
+    j["created"] = time(nullptr);
+    j["owned_by"] = "1bit-systems";
+    if (active) {
+        j["backend"] = active->id;
+        j["backend_type"] = backend_name(active->type);
+    }
+    return j;
+}
+
+// ── Build health/metrics JSON ──
+static json health_json(BackendManager& mgr) {
+    json j;
+    j["status"] = "ok";
+    j["service"] = "1bit-systems unified inference server";
+
+    auto* active = mgr.active_info();
+    if (active) {
+        j["active_backend"]["id"] = active->id;
+        j["active_backend"]["type"] = backend_name(active->type);
+        j["active_backend"]["tier"] = tier_name(active->tier);
+        j["active_backend"]["score_ms_per_tok"] = active->score;
+        j["active_backend"]["total_inferences"] = active->total_inferences;
+        j["active_backend"]["failed_inferences"] = active->failed_inferences;
+        j["active_backend"]["functional"] = active->functional;
+    }
+
+    json backends = json::array();
+    for (auto& b : mgr.backends()) {
+        json bj;
+        bj["id"] = b.id;
+        bj["type"] = backend_name(b.type);
+        bj["tier"] = tier_name(b.tier);
+        bj["available"] = b.available;
+        bj["functional"] = b.functional;
+        bj["score_ms_per_tok"] = b.score;
+        bj["total_inferences"] = b.total_inferences;
+        bj["failed_inferences"] = b.failed_inferences;
+        backends.push_back(bj);
+    }
+    j["backends"] = backends;
+
+    auto* monitor = mgr.monitor_stats();
+    j["metrics"]["total_inferences"] = monitor->total_inferences();
+    j["metrics"]["total_failures"] = monitor->total_failures();
+    j["metrics"]["total_fallbacks"] = monitor->total_fallbacks();
+
+    json per_backend = json::array();
+    for (auto* pm : monitor->all_metrics()) {
+        json mj;
+        mj["backend_id"] = pm->backend_id;
+        mj["inferences"] = pm->inferences.load();
+        mj["failures"] = pm->failures.load();
+        mj["fallbacks"] = pm->fallbacks.load();
+        mj["last_ms"] = pm->last_ms.load();
+        mj["avg_ms"] = pm->recent_ms.avg();
+        mj["tokens_per_second"] = pm->tokens_per_second.load();
+        mj["healthy"] = pm->healthy.load();
+        per_backend.push_back(mj);
+    }
+    j["metrics"]["per_backend"] = per_backend;
+
+    return j;
+}
+
+// ── Sampling: temperature + top-k + repetition penalty from raw logits ──
+// Returns a sampled token id. temperature<=0 → argmax (greedy), matching
+// OpenAI convention that temp 0 is deterministic even when top_k is set.
+// Thread-local RNG + scratch: decode may run on multiple threads, so the
+// sampler must not depend on an external locking invariant (PR #1398 review).
+static thread_local uint64_t g_sample_state = 0;
+static thread_local std::vector<float> g_sample_scaled;
+static thread_local std::vector<float> g_sample_sorted;
+static int sample_from_logits(const float* logits, int vs, float temperature,
+                               int top_k, const std::vector<int>& history,
+                               float repeat_penalty = 0.0f, float top_p = 0.0f) {
+    if (vs <= 0 || !logits) return 0;
+    if (temperature <= 0.0f) {  // greedy
+        int best = 0; float bv = logits[0];
+        for (int v = 1; v < vs; v++) if (logits[v] > bv) { bv = logits[v]; best = v; }
+        return best;
+    }
+    // xorshift64* — cheap, deterministic-enough for sampling
+    if (g_sample_state == 0)
+        g_sample_state = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+    uint64_t x = g_sample_state;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    g_sample_state = x;
+    uint64_t r = x * 0x2545F4914F6CDD1Dull;
+
+    float max_l = -1e30f;
+    for (int v = 0; v < vs; v++) if (logits[v] > max_l) max_l = logits[v];
+    float t = temperature > 0.0f ? temperature : 1.0f;
+    auto& scaled = g_sample_scaled;
+    scaled.resize(vs);
+    if (top_k > 0 && top_k < vs) {
+        auto& sorted = g_sample_sorted;
+        sorted.assign(logits, logits + vs);
+        std::nth_element(sorted.begin(), sorted.begin() + top_k - 1, sorted.end(),
+                         std::greater<float>());
+        float cutoff = sorted[top_k - 1];
+        for (int v = 0; v < vs; v++)
+            scaled[v] = logits[v] < cutoff ? 0.0f : expf((logits[v] - max_l) / t);
+    } else {
+        for (int v = 0; v < vs; v++) scaled[v] = expf((logits[v] - max_l) / t);
+    }
+    if (repeat_penalty > 0.0f && repeat_penalty != 1.0f && !history.empty()) {
+        // Discourage recently-seen tokens (vanilla repetition penalty: divide
+        // logits by the penalty). Without it small models loop under sampling
+        // too ("Answer: Paris" x8). The history is short (this request's
+        // output only) so a linear scan is fine.
+        float norm = repeat_penalty / t;
+        for (int v : history)
+            if (v >= 0 && v < vs) scaled[v] = expf((logits[v] - max_l) / t - norm);
+    }
+    float sum = 0; for (int v = 0; v < vs; v++) sum += scaled[v];
+    if (top_p > 0.0f && top_p < 1.0f && sum > 0) {
+        // Nucleus: keep the smallest set of tokens whose cumulative mass
+        // reaches top_p, zero the rest. Without it, temp 0.8 over a 128k
+        // vocab samples random junk (zaya defaults: 0.8 / 0.95 / 1.1).
+        auto& sorted = g_sample_sorted;
+        sorted.assign(scaled.begin(), scaled.end());
+        std::sort(sorted.begin(), sorted.end(), std::greater<float>());
+        double cum = 0.0;
+        float cutoff = 0.0f;
+        for (float s : sorted) {
+            cum += s;
+            if (cum >= (double)top_p * sum) { cutoff = s; break; }
+        }
+        for (int v = 0; v < vs; v++)
+            if (scaled[v] < cutoff) scaled[v] = 0.0f;
+        sum = 0; for (int v = 0; v < vs; v++) sum += scaled[v];
+    }
+    if (!(sum > 0)) return 0;  // degenerate logits — fall back to token 0
+    double rnd = (double)(r >> 11) / 9007199254740992.0 * (double)sum;
+    for (int v = 0; v < vs; v++) { rnd -= scaled[v]; if (rnd <= 0) return v; }
+    return vs - 1;
+}
+
+// ── Generate completion with per-token strategy routing ──
+// Returns { text, tokens, backend_used, ms_per_tok, tok_s }
+// When strategy_engine is provided, routes each token through the strategy
+// instead of using a fixed backend.
+// ── Speculative decode loop ──
+// Mirrors tools/spec_decode.cpp (the verified-lossless reference): draft
+// proposes N greedy tokens, the target verifies them in ONE batch decode,
+// the longest greedy-consistent prefix is accepted, rejected positions are
+// rolled back and the fix token is re-decoded in place. Both contexts are
+// kept symmetric so the draft's KV stays a valid prefix of the target's.
+// Returns true on success (even zero-length output); false = backend failed
+// (caller falls back to the normal loop).
+static bool run_spec_decode(Backend* target, Backend* draft,
+                            const std::vector<int>& prompt_tokens,
+                            int prefill_start, int max_tokens, int eos_id,
+                            std::vector<int>& out, int& n_accept, int& n_reject,
+                            std::chrono::high_resolution_clock::time_point deadline) {
+    // Prefill BOTH contexts with the prompt (single-token decodes — the
+    // fork's KV rejects multi-token batches outside the verify step).
+    // The draft and target have DIFFERENT vocabs (and logits) — keep them
+    // separate: tlg = target's last decode, dlg = draft's last decode.
+    // (One shared buffer made the first output token the DRAFT's argmax.)
+    std::vector<float> tlg, dlg;
+    for (size_t i = prefill_start; i < prompt_tokens.size(); i++) {
+        if (!target->decode_one(prompt_tokens[i], tlg)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] prefill target failed at %d\n", (int)i); return false; }
+        if (!draft->decode_one(prompt_tokens[i], dlg)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] prefill draft failed at %d\n", (int)i); return false; }
+    }
+
+    // First output token: the TARGET's greedy argmax after the last prompt
+    // token, decoded into BOTH KVs; the target's logits anchor proposal[0]
+    // of the first round, the draft's logits seed its proposals.
+    int vs = (int)tlg.size();
+    int kv_base = (int)(prompt_tokens.size() - prefill_start) + 1;  // KV len after first token
+    int tok = (int)(std::max_element(tlg.begin(), tlg.end()) - tlg.begin());
+    if (!target->decode_one(tok, tlg)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] first-target decode failed\n"); return false; }
+    std::vector<float> prev_logits = tlg;   // target's logits after tok
+    if (!draft->decode_one(tok, dlg)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] first-draft decode failed\n"); return false; }
+    std::vector<float> dlogits = dlg;   // draft's logits after tok (its proposals)
+    out.push_back(tok);
+
+    auto argmax = [](const std::vector<float>& l) {
+        return (int)(std::max_element(l.begin(), l.end()) - l.begin());
+    };
+    auto argmaxp = [&](const float* l) {
+        int best = 0;
+        for (int v = 1; v < vs; v++) if (l[v] > l[best]) best = v;
+        return best;
+    };
+
+    while ((int)out.size() < max_tokens) {
+        if (std::chrono::high_resolution_clock::now() >= deadline) break;
+
+        // 1. Draft proposes N greedy tokens from its OWN logits (the tokens
+        //    are in its KV as it goes — no re-decode).
+        std::vector<int> proposals;
+        for (int i = 0; i < g_spec_n_draft; i++) {
+            int nxt = argmax(dlogits);
+            proposals.push_back(nxt);
+            if (!draft->decode_one(nxt, dlogits)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] draft propose failed at %d\n", i); return false; }
+        }
+
+        // 2. Target verifies ALL proposals in one batch at consecutive
+        //    positions, per-position logits (vocab floats each).
+        std::vector<float> vlogits;
+        if (!target->verify_batch(proposals, vlogits)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] verify_batch failed (N=%d)\n", (int)proposals.size()); return false; }
+
+        // 3. Accept the longest greedy-consistent prefix: proposal[0] must
+        //    match the LAST REAL decode's logits (prev_logits), proposal
+        //    [i>0] the verify batch's position i-1.
+        int n_acc = 0;
+        for (int i = 0; i < (int)proposals.size(); i++) {
+            const float* lgv = (i == 0) ? prev_logits.data()
+                                        : vlogits.data() + (size_t)(i - 1) * vs;
+            if (argmaxp(lgv) == proposals[i]) n_acc++;
+            else break;
+        }
+        n_accept += n_acc;
+        n_reject += (int)proposals.size() - n_acc;
+
+        // 4. Emit the accepted prefix (already in both KVs), capped.
+        for (int i = 0; i < n_acc && (int)out.size() < max_tokens; i++)
+            out.push_back(proposals[i]);
+        if (n_acc == (int)proposals.size()) {
+            // All accepted: the last proposal's logits predict the next token
+            // — decode it into the target KV (like the reject path's fix
+            // decode) so the next round starts from a real decode.
+            tok = argmaxp(vlogits.data() + (size_t)(proposals.size() - 1) * vs);
+            if (!target->decode_one(tok, tlg)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] all-accept decode failed\n"); return false; }
+            prev_logits = tlg;
+            kv_base += (int)proposals.size() + 1;
+        } else {
+            // Rejected at n_acc: that position's prediction IS the fix token.
+            // Drop the rejected proposal from the target KV, decode the fix
+            // in place, and rewind the draft to the accepted prefix (both
+            // KVs end at kv_base + n_acc + 1).
+            const float* lgv = (n_acc == 0) ? prev_logits.data()
+                                            : vlogits.data() + (size_t)(n_acc - 1) * vs;
+            tok = argmaxp(lgv);
+            if (!target->rollback(kv_base + n_acc)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] target rollback failed\n"); return false; }
+            if (!target->decode_one(tok, tlg)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] fix decode failed\n"); return false; }
+            prev_logits = tlg;
+            if (!draft->rollback(kv_base + n_acc)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] draft rollback failed\n"); return false; }
+            kv_base = kv_base + n_acc + 1;
+        }
+        if ((int)out.size() >= max_tokens) break;
+        out.push_back(tok);
+        // Sync the draft KV with the fix token (accepted proposals are
+        // already there — the draft proposed them itself).
+        if (!draft->decode_one(tok, dlg)) { if (getenv("SPEC_DEBUG")) fprintf(stderr, "[spec] draft sync failed\n"); return false; }
+        dlogits = dlg;
+        if (tok == eos_id) break;
+    }
+    return true;
+}
+
+
+static json generate_completion(BackendManager& mgr,
+                                 const std::vector<int>& prompt_tokens,
+                                 const std::vector<double>& prompt_logprobs,
+                                 int max_tokens,
+                                 const std::string& backend_id,
+                                 StrategyEngine* strategy_engine = nullptr,
+                                 const std::string& user_message = "",
+                                 float temperature = 0.0f,
+                                 int top_k = 0,
+                                 const std::string& raw_prompt = "",
+                                 float repeat_penalty = 0.0f,
+                                 float top_p = 0.0f,
+                                 const std::string& session_id = "") {
+    json result;
+
+    // Select fixed backend if specified (overrides strategy routing).
+    // Mutates mgr state read by /v1/health + /v1/models under g_config_mutex (issue #1271).
+    if (backend_id != "auto" && backend_id != "") {
+        std::lock_guard<std::mutex> cfg_lock(g_config_mutex);
+        mgr.select_backend(backend_id);
+    }
+
+    // ── Pre-generate: pick initial backend via strategy ──
+    std::string active_backend_id;
+    if (strategy_engine) {
+        // Use strategy to pick initial backend
+        // For the first token, we don't have logprobs yet
+        TokenContext init_ctx{-1, 0.0, -1.0, 0,
+                             prompt_tokens.size(), (size_t)max_tokens,
+                             user_message};
+        // route() reads strategy state that /v1/strategy/select mutates under
+        // g_strategy_mutex — same lock here (issue #1271).
+        std::lock_guard<std::mutex> strat_lock(g_strategy_mutex);
+        auto decision = strategy_engine->route(init_ctx);
+        active_backend_id = decision.backend;
+        if (!decision.draft_backend.empty()) {
+            active_backend_id = decision.draft_backend;
+        }
+        mgr.select_backend(active_backend_id);
+    } else {
+        active_backend_id = backend_id;
+    }
+
+    auto* active = mgr.active_info();
+    // Without a strategy engine, tokens are routed per-token through the
+    // DynamicRouter — report the backend that actually served the most
+    // tokens, not the (possibly stale) active-backend pointer.
+    result["backend_used"] = active ? active->id : "none";
+    if (!strategy_engine) {
+        auto rstats = mgr.router_stats();
+        long long best_n = -1;
+        for (const auto& st : rstats) {
+            if (st.total_tokens > best_n) { best_n = st.total_tokens; result["backend_used"] = st.id; }
+        }
+    }
+    result["strategy"] = strategy_engine ? strategy_engine->name() : "none";
+
+    // Reset backend state for new sequence
+    if (!mgr.reset()) {
+        result["error"] = "Failed to reset backend";
+        result["tokens"] = json::array();
+        result["text"] = "";
+        return result;
+    }
+
+    // ── Text-level backends (e.g. NPU FLM): whole-prompt generation ──
+    // FLM tokenizes internally, so the token loop below can't drive it.
+    // The strategy engine already selected the initial backend above.
+    if (!raw_prompt.empty()) {
+        auto* active = mgr.active_backend();
+        if (active) {
+            // Multi-turn KV reuse: when this request continues the live
+            // session (same session_id, prompt extends the previous one),
+            // send only the delta — the device-resident KV cache stays warm.
+            // Otherwise send the full prompt, which resets the session.
+            std::string text;
+            std::string delta;
+            bool cont = false;
+            {
+                std::lock_guard<std::mutex> lock(g_flm_session_mutex);
+                cont = npu_flm_session_continue(session_id, g_flm_session_id,
+                                                g_flm_session_last, raw_prompt, delta);
+            }
+            if (cont) {
+                text = active->continue_text(delta);
+                if (text.empty()) cont = false;  // continuation failed → full reset retry
+            }
+            if (!cont) {
+                text = active->generate_text(raw_prompt, max_tokens);
+                if (!text.empty()) {  // only record the baseline on success
+                    std::lock_guard<std::mutex> lock(g_flm_session_mutex);
+                    g_flm_session_id = session_id;
+                    g_flm_session_last = raw_prompt;
+                }
+            }
+            if (!text.empty()) {
+                int gen_tokens = std::max(1, (int)(text.size() / 4));  // ~4 chars/token est
+                result["text"] = text;
+                result["gen_tokens"] = gen_tokens;
+                result["gen_ms"] = 0;
+                result["tok_s"] = 0.0f;
+                result["backend_used"] = active_backend_id;
+                return result;
+            }
+        }
+    }
+
+    std::vector<int> output_tokens;
+    std::vector<double> output_logprobs;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto timeout_deadline = t0 + std::chrono::milliseconds(g_generation_timeout_ms);
+    bool timed_out = false;
+    int last_token = prompt_tokens.empty() ? g_tokenizer.bos_id : prompt_tokens.back();
+
+    // Prefill: process prompt tokens
+    // Skip BOS token (first token == bos_id) for SSM models where
+    // feeding BOS as a regular token corrupts the recurrent state.
+    size_t prefill_start = 0;
+    if (!prompt_tokens.empty() && prompt_tokens[0] == g_tokenizer.bos_id) {
+        prefill_start = 1;
+    }
+
+    // ── Speculative decode: draft proposes, target verifies in batches ──
+    // Lossless vs greedy (exact-argmax acceptance). If the active backend or
+    // the draft can't do it (decode_one/verify_batch/rollback unsupported),
+    // run_spec_decode fails fast and we fall back to the normal loop below
+    // (both KVs are reset, so the fallback starts clean).
+    if (g_spec_decode && g_draft_backend && g_draft_backend->initialized) {
+        Backend* target = mgr.active_backend();
+        if (target) {
+            // Fresh draft KV per request (mgr.reset() above cleared the target).
+            g_draft_backend->reset();
+            int n_acc = 0, n_rej = 0;
+            std::vector<int> spec_toks;
+            bool ok = run_spec_decode(target, g_draft_backend, prompt_tokens,
+                                      (int)prefill_start, max_tokens,
+                                      g_tokenizer.eos_id, spec_toks, n_acc, n_rej,
+                                      timeout_deadline);
+            if (ok) {
+                float ms = std::chrono::duration<float, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+                result["tokens"] = spec_toks;
+                result["text"] = g_tokenizer.decode(spec_toks);
+                result["gen_ms"] = ms;
+                result["gen_tokens"] = (int)spec_toks.size();
+                result["speculative"] = true;
+                result["accept_rate"] =
+                    (n_acc + n_rej) > 0 ? (float)n_acc / (float)(n_acc + n_rej) : 0.0f;
+                result["accepted"] = n_acc;
+                result["rejected"] = n_rej;
+                if (ms > 0) {
+                    result["tok_s"] = (float)spec_toks.size() / (ms / 1000.0f);
+                    result["ms_per_tok"] = ms / (float)std::max(1, (int)spec_toks.size());
+                } else {
+                    result["tok_s"] = 0; result["ms_per_tok"] = 0;
+                }
+                return result;
+            }
+            fprintf(stderr, "[spec] backend failed — falling back to normal loop\n");
+            mgr.reset();
+            g_draft_backend->reset();
+        }
+    }
+
+    for (size_t i = prefill_start; i + 1 < prompt_tokens.size(); i++) {
+        // Check generation timeout between prefill tokens (issue #948)
+        if (g_generation_timeout_ms > 0 &&
+            std::chrono::high_resolution_clock::now() >= timeout_deadline) {
+            float ms = std::chrono::duration<float, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            result["error"] = "Generation timed out during prefill after " +
+                               std::to_string((int)ms) + "ms";
+            result["gen_ms"] = ms;
+            result["gen_tokens"] = (int)output_tokens.size();
+            result["text"] = "";
+            result["timed_out"] = true;
+            return result;
+        }
+        int result_id = mgr.generate(prompt_tokens[i]);
+        if (result_id < 0) {
+            float ms = std::chrono::duration<float, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            result["error"] = "Backend failed during prefill at token " + std::to_string(i);
+            result["gen_ms"] = ms;
+            result["gen_tokens"] = (int)output_tokens.size();
+            return result;
+        }
+    }
+
+    // ── Generate new tokens with per-token strategy routing ──
+    // Track which backend each token goes to
+    std::vector<std::string> per_token_backend;
+    for (int i = 0; i < max_tokens; i++) {
+        // ── Check generation timeout (issue #948) ──
+        // Timeout is checked per-token so g_inference_mutex is released promptly
+        // when a slow request exceeds the wall-clock limit. This prevents a single
+        // client from holding the server hostage while the model slowly accumulates
+        // memory (e.g. zamba-7b-v1 on CPU grew to 56.5GB over ~11 minutes).
+        if (g_generation_timeout_ms > 0 &&
+            std::chrono::high_resolution_clock::now() >= timeout_deadline) {
+            timed_out = true;
+            break;
+        }
+
+        // ── Strategically choose backend for this token ──
+        if (strategy_engine) {
+            // Build logprob/entropy from last generated output
+            double last_lp = 0.0;
+            double last_entropy = -1.0;
+            if (!output_logprobs.empty()) {
+                last_lp = output_logprobs.back();
+            } else if (!prompt_logprobs.empty()) {
+                last_lp = prompt_logprobs.back();
+            }
+
+            TokenContext ctx{last_token, last_lp, last_entropy,
+                            (size_t)i, prompt_tokens.size(), (size_t)max_tokens,
+                            user_message};
+            // issue #1271: strategy state is mutated under g_strategy_mutex
+            std::lock_guard<std::mutex> strat_lock(g_strategy_mutex);
+            auto decision = strategy_engine->route(ctx);
+
+            // Select the decided backend
+            if (mgr.select_backend(decision.backend)) {
+                active_backend_id = decision.backend;
+            }
+            per_token_backend.push_back(decision.backend);
+        }
+
+        // ── Generate token ──
+        // When strategy engine needs logprobs (cascade/adaptive) or the caller
+        // requested temperature/top-k sampling, use forward()+lm_head()
+        // separately for real logits. Otherwise, use fast generate() which
+        // does both in one call.
+        bool need_logprobs = strategy_engine && (
+            strategy_engine->name() == std::string("cascade") ||
+            strategy_engine->name() == std::string("adaptive")
+        );
+        bool want_sampling = temperature > 0.0f || top_k > 0;
+        bool use_logits_path = need_logprobs || want_sampling;
+
+        int next = -1;
+        double token_logprob = 0.0;
+
+        // First token (i==0): compute logprob from the last prompt token's
+        // forward pass so cascade has a real confidence signal immediately.
+        int vs = 262272, hs = 2048;
+        auto* ai = mgr.active_info();
+        if (ai && ai->instance) {
+            auto& mcfg = ai->instance->cfg;
+            if (mcfg.vocab_size > 0) vs = mcfg.vocab_size;
+            else if (mcfg.vocab > 0) vs = mcfg.vocab;
+            if (mcfg.hidden_size > 0) hs = mcfg.hidden_size;
+            else if (mcfg.hidden > 0) hs = mcfg.hidden;
+        }
+        if (i == 0 && use_logits_path && output_logprobs.empty()) {
+            std::vector<float> hidden_buf(hs);
+            std::vector<float> logits_buf(vs);
+            if (mgr.forward(last_token, hidden_buf.data())) {
+                int tmp_id = -1;
+                if (mgr.lm_head(hidden_buf.data(), logits_buf.data(), &tmp_id)) {
+                    if (getenv("DUMP_LOGITS")) {
+                        // Top-5 logits + gaps — sanity check for sampling
+                        std::vector<int> idx(vs);
+                        for (int v = 0; v < vs; v++) idx[v] = v;
+                        std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+                            [&](int a, int b) { return logits_buf[a] > logits_buf[b]; });
+                        fprintf(stderr, "[sample] top5:");
+                        for (int k = 0; k < 5; k++)
+                            fprintf(stderr, " %d=%.2f", idx[k], logits_buf[idx[k]]);
+                        fprintf(stderr, " (gap %.2f, vs=%d)\n",
+                                logits_buf[idx[0]] - logits_buf[idx[1]], vs);
+                    }
+                    if (want_sampling)
+                        tmp_id = sample_from_logits(logits_buf.data(), vs, temperature, top_k,
+                                                    output_tokens, repeat_penalty, top_p);
+                    float max_l = -1e30f;
+                    for (int v = 0; v < vs; v++)
+                        if (logits_buf[v] > max_l) max_l = logits_buf[v];
+                    double sum_exp = 0.0;
+                    for (int v = 0; v < vs; v++)
+                        sum_exp += exp((double)(logits_buf[v] - max_l));
+                    if (sum_exp > 0 && tmp_id >= 0 && tmp_id < vs)
+                        token_logprob = (double)(logits_buf[tmp_id] - max_l) - log(sum_exp);
+                    else
+                        token_logprob = -20.0;
+                }
+                next = tmp_id;
+            }
+        } else if (use_logits_path) {
+            // Slow path: forward + lm_head + softmax for real logprobs
+            std::vector<float> hidden_buf(hs);
+            std::vector<float> logits_buf(vs);
+            if (mgr.forward(last_token, hidden_buf.data())) {
+                if (mgr.lm_head(hidden_buf.data(), logits_buf.data(), &next)) {
+                    if (want_sampling)
+                        next = sample_from_logits(logits_buf.data(), vs, temperature, top_k,
+                                                  output_tokens, repeat_penalty, top_p);
+                    float max_l = -1e30f;
+                    for (int v = 0; v < vs; v++)
+                        if (logits_buf[v] > max_l) max_l = logits_buf[v];
+                    double sum_exp = 0.0;
+                    for (int v = 0; v < vs; v++)
+                        sum_exp += exp((double)(logits_buf[v] - max_l));
+                    if (sum_exp > 0 && next >= 0 && next < vs)
+                        token_logprob = (double)(logits_buf[next] - max_l) - log(sum_exp);
+                    else
+                        token_logprob = -20.0;
+                }
+            }
+        } else {
+            // Fast path: generate() does forward+lm_head+argmax in one call
+            next = mgr.generate(last_token);
+        }
+
+        if (next < 0) {
+            // Backend failed — try fallback with generate()
+            if (mgr.backends().size() > 1) {
+                for (auto& b : mgr.backends()) {
+                    if (b.available && b.functional && b.instance) {
+                        mgr.select_backend(b.id);
+                        active_backend_id = b.id;
+                        next = mgr.generate(last_token);
+                        if (next >= 0) {
+                            // Compute actual logprob for cascade/adaptive strategy
+                            std::vector<float> hb(hs);
+                            std::vector<float> lb(vs);
+                            if (need_logprobs && mgr.forward(next, hb.data())) {
+                                int argmax;
+                                if (mgr.lm_head(hb.data(), lb.data(), &argmax)) {
+                                    float max_l = -1e30f;
+                                    for (int v = 0; v < vs; v++) if (lb[v] > max_l) max_l = lb[v];
+                                    double sum_exp = 0.0;
+                                    for (int v = 0; v < vs; v++) sum_exp += exp((double)(lb[v] - max_l));
+                                    if (sum_exp > 0 && next >= 0 && next < vs)
+                                        token_logprob = (double)(lb[next] - max_l) - log(sum_exp);
+                                }
+                            } else {
+                                token_logprob = -10.0;  // uncertain
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if (next < 0) break;
+        }
+
+        output_tokens.push_back(next);
+        output_logprobs.push_back(token_logprob);
+        last_token = next;
+
+        if (next == g_tokenizer.eos_id) break;
+    }
+
+    float ms = std::chrono::duration<float, std::milli>(
+        std::chrono::high_resolution_clock::now() - t0).count();
+
+    result["tokens"] = output_tokens;
+    result["text"] = g_tokenizer.decode(output_tokens);
+    result["gen_ms"] = ms;
+    result["gen_tokens"] = (int)output_tokens.size();
+    result["per_token_backend"] = per_token_backend;
+    if (timed_out) {
+        result["error"] = "Generation timed out after " +
+                           std::to_string((int)ms) + "ms";
+        result["timed_out"] = true;
+    }
+    if (ms > 0) {
+        result["tok_s"] = (float)output_tokens.size() / (ms / 1000.0f);
+        result["ms_per_tok"] = ms / (float)output_tokens.size();
+    } else {
+        result["tok_s"] = 0;
+        result["ms_per_tok"] = 0;
+    }
+
+    return result;
+}
+
+
+// ── Singleton guard ──
+// Only one unified_server should ever run at a time: each instance holds a
+// full model's worth of RAM, and dev iteration (rebuild + relaunch, often on
+// a different --port) otherwise leaves the old one running in the background
+// forever. On startup, stop whatever instance is already running before
+// taking over. The lock fd is kept open for the process lifetime so the OS
+// releases it automatically on exit or crash — no explicit cleanup needed.
+//
+// Uses XDG_RUNTIME_DIR when available (private per-user) to avoid /tmp races.
+// Never kills processes based on a comm-name heuristic (fixes #615).
+
+#ifndef _WIN32
+#include <uuid/uuid.h>
+
+static std::string lock_file_path() {
+    const char* xdg = getenv("XDG_RUNTIME_DIR");
+    if (xdg && xdg[0]) return std::string(xdg) + "/unified_server.lock";
+    return "/tmp/unified_server.lock";
+}
+
+static void acquire_singleton_lock() {
+    std::string lock_path = lock_file_path();
+    const char* kLockPath = lock_path.c_str();
+
+    int fd = open(kLockPath, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "Fatal: could not open lock file %s (%s) — cannot guard against concurrent instances. Exiting.\n",
+                kLockPath, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    // Write a unique token (PID + random uuid) so we can verify ownership
+    // without relying on /proc/PID/comm matching.
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char uuid_str[37];
+    uuid_unparse(uuid, uuid_str);
+
+    char my_token[128];
+    int n = snprintf(my_token, sizeof(my_token), "%d:%s", (int)getpid(), uuid_str);
+
+    // Only try to kill previous instance if we can confirm ownership via our own token.
+    // We DO NOT kill processes based on comm-name matching (see #615).
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        // Read the previous owner's token
+        char old_buf[128] = {0};
+        pread(fd, old_buf, sizeof(old_buf) - 1, 0);
+
+        pid_t old_pid = 0;
+        char* colon = strchr(old_buf, ':');
+        if (colon) {
+            *colon = '\0';
+            old_pid = (pid_t)atoi(old_buf);
+            *colon = ':';  // restore
+        }
+
+        if (old_pid > 0) {
+            // Check if the old process still exists by sending signal 0.
+            // If it doesn't exist, the lock is stale — remove and retry.
+            if (kill(old_pid, 0) != 0) {
+                fprintf(stderr, "Warning: stale lock from pid %d — removing\n", (int)old_pid);
+                close(fd);
+                unlink(kLockPath);
+                fd = open(kLockPath, O_CREAT | O_RDWR, 0644);
+                if (fd < 0) {
+                    fprintf(stderr, "Fatal: could not recreate lock file (%s)\n", strerror(errno));
+                    exit(EXIT_FAILURE);
+                }
+                // Retry flock
+                if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+                    fprintf(stderr, "Fatal: could not acquire singleton lock (%s) — another instance running. Exiting.\n",
+                            strerror(errno));
+                    exit(EXIT_FAILURE);
+                }
+            } else {
+                // Previous instance is still alive. Log and exit.
+                fprintf(stderr, "Another instance is already running (pid %d). Exiting.\n", (int)old_pid);
+                fprintf(stderr, "  Use a different --port or stop the existing instance first.\n");
+                close(fd);
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            // Can't parse token — stale or corrupted lock file. Remove and retry.
+            fprintf(stderr, "Warning: unparseable lock file — removing stale lock\n");
+            close(fd);
+            unlink(kLockPath);
+            fd = open(kLockPath, O_CREAT | O_RDWR, 0644);
+            if (fd < 0) {
+                fprintf(stderr, "Fatal: could not recreate lock file (%s)\n", strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+                fprintf(stderr, "Fatal: could not acquire singleton lock (%s) — another instance running. Exiting.\n",
+                        strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+
+    // Write our unique token
+    if (ftruncate(fd, 0) != 0) { /* best-effort */ }
+    if (pwrite(fd, my_token, n, 0) != n) { /* best-effort */ }
+    // fd intentionally leaked (kept open) for the process lifetime.
+}
+#else
+// Windows: no singleton lock (POSIX-only)
+static void acquire_singleton_lock() {}
+#endif
+
+// ════════════════════════════════════════════════════════════════════════
+//  Main
+// ════════════════════════════════════════════════════════════════════════
+
+#ifdef EMBED_LEMONADE
+// ── Embedded Lemonade server core ─────────────────────────────────────────
+// Hand off to Lemonade's full server (github.com/lemonade-sdk/lemonade,
+// pinned in third_party/lemonade): all 14 backends (llamacpp, flm,
+// whispercpp, sd-cpp, kokoro, ryzenai-llm, vllm, ...) + the policy-based
+// Router run in this binary. Remaining argv is passed to Lemonade's CLI.
+#include <lemon/cli_parser.h>
+#include <lemon/config_file.h>
+#include <lemon/logging_config.h>
+#include <lemon/runtime_config.h>
+#include <lemon/server.h>
+#include <lemon/utils/path_utils.h>
+#include <memory>
+
+static int run_embedded_lemonade(int argc, char** argv) {
+    lemon::CLIParser parser;
+    parser.parse(argc, argv);
+    if (!parser.should_continue()) {
+        return parser.get_exit_code();
+    }
+    auto cli_config = parser.get_config();
+
+    lemon::utils::set_cache_dir(cli_config.cache_dir);
+    auto config_json = lemon::ConfigFile::load(cli_config.cache_dir);
+    if (cli_config.port != -1) config_json["port"] = cli_config.port;
+    if (!cli_config.host.empty()) config_json["host"] = cli_config.host;
+    auto config = std::make_shared<lemon::RuntimeConfig>(config_json);
+    lemon::RuntimeConfig::set_global(config.get());
+    lemon::configure_application_logging(config->log_level(),
+                                         lemon::LoggingMode::direct_server);
+
+    lemon::Server server(config, cli_config.cache_dir);
+    server.run();
+    return 0;
+}
+#endif
+
+#ifdef ONE_BIN_DISPATCH
+int unified_server_main(int argc, char** argv) {
+#else
+int main(int argc, char** argv) {
+    // Line-buffer stdout when redirected (logs, CI): block buffering merged
+    // lifecycle prints with stderr and hid model-switch diagnostics (the
+    // "[auto]"/"switching" lines appeared glued to unrelated output).
+    // Windows-skipped: MSVC's setvbuf doesn't support true line buffering —
+    // Microsoft's own docs say _IOLBF is mapped to _IOFBF internally — and
+    // calling it here with this UCRT + static-CRT (/MT) combination crashes
+    // with a stack-buffer-overrun fastfail (0xC0000409) before main() gets
+    // anywhere near argv parsing. No portable behavior lost by skipping it.
+#ifndef _WIN32
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
+#endif  // ONE_BIN_DISPATCH
+#ifdef EMBED_LEMONADE
+    // --lemonade hands off to the embedded Lemonade server core before any
+    // of the native arg parsing / hardware init below.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--lemonade") == 0) {
+            return run_embedded_lemonade(argc, argv);
+        }
+    }
+#endif
+    signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
+
+    // ── Help flag — must be handled FIRST, before any hardware init ──
+    // Scan for -h/--help so we never open /dev/accel, acquire locks,
+    // or init NPU/GPU just to print usage info.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: %s [OPTIONS]\n", argv[0]);
+            printf("  -p, --port PORT         HTTP port (default: 8088)\n");
+            printf("  -w, --weights DIR       Model weights directory\n");
+            printf("  -m, --model NAME        Model name to load\n");
+            printf("  -q, --quick             Quick mode (skip full init)\n");
+            printf("  -c, --cors-origin ORG   CORS origin header value\n");
+            printf("  -t, --gen-timeout-ms MS Generation timeout (default: 600000)\n");
+#ifdef EMBED_LEMONADE
+            printf("      --lemonade          Run the embedded Lemonade server core\n");
+#endif
+            printf("  -B, --batch-slots N     Concurrent decode slots (default: 1)\n");
+            printf("      --draft-model PATH  Small model for speculative decode\n");
+            printf("      --spec-decode       Verify draft proposals in batches (needs --draft-model)\n");
+            printf("      --pool              Keep all models resident in the unified pool\n");
+            printf("  -h, --help              Show this help and exit\n");
+            exit(0);
+        }
+    }
+
+    // ── Parse CLI args ──
+    // Generation timeout: CLI override of g_generation_timeout_ms (issue #948)
+    int cli_gen_timeout_ms = -1;
+    static struct option long_opts[] = {
+        {"port",          required_argument, nullptr, 'p'},
+        {"weights",       required_argument, nullptr, 'w'},
+        {"model",         required_argument, nullptr, 'm'},
+        {"quick",         no_argument,       nullptr, 'q'},
+        {"cors-origin",   required_argument, nullptr, 'c'},
+        {"gen-timeout-ms", required_argument, nullptr, 't'},
+        {"free-npu",      no_argument,       nullptr, 'F'},
+        {"mmproj",        required_argument, nullptr, 'M'},
+        {"batch-slots",   required_argument, nullptr, 'B'},
+        {"draft-model",   required_argument, nullptr, 1001},
+        {"spec-decode",   no_argument,       nullptr, 1002},
+        {"pool",          no_argument,       nullptr, 1003},
+        {nullptr, 0, nullptr, 0}
+    };
+
+    bool quick_mode = false;
+    bool free_npu = false; (void)free_npu;
+    std::string g_cors_origin;
+    std::string g_model_name;
+    int opt;
+    while ((opt = getopt_long(argc, argv, "p:w:m:c:q", long_opts, nullptr)) != -1) {
+        switch (opt) {
+            case 'p': g_port = atoi(optarg); break;
+            case 'w': g_weights_dir = optarg; break;
+            case 'm': g_model_name = optarg; break;
+            case 'q': quick_mode = true; break;
+            case 'c': g_cors_origin = optarg; break;
+            case 't': cli_gen_timeout_ms = atoi(optarg); break;
+            case 'F': free_npu = true; break;
+            case 'M': g_mmproj_path = optarg; break;
+            case 'B': g_batch_slots = atoi(optarg); break;
+            case 1001: g_draft_model_path = optarg; break;
+            case 1002: g_spec_decode = true; break;
+            case 1003: g_pool_enabled = true; break;
+        }
+    }
+
+    if (g_spec_decode && g_draft_model_path.empty()) {
+        printf("  ⚠  --spec-decode requires --draft-model; speculative mode disabled\n");
+        g_spec_decode = false;
+    }
+
+    // Apply CLI timeout override after env default
+    if (cli_gen_timeout_ms >= 0) {
+        g_generation_timeout_ms = cli_gen_timeout_ms;
+    }
+
+    acquire_singleton_lock();
+
+    printf("\n");
+    printf("╔═══════════════════════════════════════════════╗\n");
+    printf("║                                               ║\n");
+    printf("║   1bit.systems — Unified Inference Server    ║\n");
+    printf("║   One binary, all backends, auto-failover    ║\n");
+    printf("║                                               ║\n");
+    printf("╚═══════════════════════════════════════════════╝\n");
+    printf("\n");
+    // ── Apply RLIMIT_AS as an OOM safety net (issue #948) ──
+    // Set virtual address space limit: prevent a single slow request from growing
+    // unbounded (e.g. zamba-7b-v1 reached 56.5GB over 11 minutes). The limit is
+    // set high enough to never interfere with normal operation but low enough that
+    // runaway memory allocation triggers ENOMEM (malloc returns NULL or SIGSEGV
+    // in overcommit mode) rather than the kernel OOM killer taking the whole
+    // process down. 256 GB leaves ample headroom for 122 GB physical RAM + swap.
+#ifndef _WIN32
+    {
+        struct rlimit as_lim;
+        as_lim.rlim_cur = 256L * 1024 * 1024 * 1024;  // 256 GB
+        as_lim.rlim_max = 256L * 1024 * 1024 * 1024;
+        if (setrlimit(RLIMIT_AS, &as_lim) != 0) {
+            fprintf(stderr, "  ⚠  Could not set RLIMIT_AS (%s) — OOM safety net disabled\n",
+                    strerror(errno));
+        } else {
+            printf("  ✓  RLIMIT_AS set to 256 GB (OOM safety net)\n");
+        }
+    }
+#endif
+
+    printf("  Weights:    %s\n", g_weights_dir.c_str());
+    printf("  Port:       %d\n", g_port);
+    printf("  Gen Timeout: %s\n", g_generation_timeout_ms > 0
+           ? (std::to_string(g_generation_timeout_ms) + "ms").c_str()
+           : "disabled");
+    printf("\n");
+
+    // ── Load tokenizer ──
+    std::string tok_path = tokenizer_path();
+    if (!g_tokenizer.load(tok_path)) {
+        printf("  ⚠  Tokenizer not found at %s\n", tok_path.c_str());
+        printf("     Using fallback tokenizer (ASCII passthrough)\n");
+    } else {
+        printf("  ✓  Tokenizer loaded\n");
+    }
+
+    // ── Create BackendManager ──
+    auto& mgr = backend_manager();
+
+    // Phase 1: Discover hardware
+    printf("\n── Hardware Discovery ──\n");
+    mgr.discover();
+
+    // Phase 2: Configure
+    mgr.set_strategy(SelectionStrategy::FASTEST);
+    mgr.set_fallback_policy(FallbackPolicy::SEQUENTIAL);
+
+    // Phase 2.5: Scan for model files
+    printf("\n── Model Discovery ──\n");
+    static std::vector<ModelConfig> discovered = discover_models(g_weights_dir);
+
+    // Format preference: when several files share a base model name, prefer
+    // the quality format over the size tier (measured: Q8_0 near-lossless,
+    // Q4_K_M only lossless ≥7B, 1bp loses to INT8 on every model gated).
+    // GGUF (Q8_0/Q4_K_M) > Q4NX > H1B > 1BP. Exact .1bp requests still work
+    // — exact match runs on the full name before this ordering matters.
+    // Within GGUF, rank by quant quality: Q8_0 > Q6/Q5 > Q4 (Q8_0 is the
+    // quality default on <7B; Q4 is a memory-constrained explicit choice).
+    auto fmt_rank = [](ModelFormat f) {
+        switch (f) {
+            case ModelFormat::GGUF:  return 0;
+            case ModelFormat::Q4NX:  return 1;
+            case ModelFormat::H1B:   return 2;
+            case ModelFormat::ONEBP: return 3;
+            default:                 return 4;
+        }
+    };
+    auto quant_rank = [](const std::string& q) {
+        if (q.find("Q8_0") != std::string::npos) return 0;
+        if (q.find("Q6_K") != std::string::npos || q.find("Q5") != std::string::npos) return 1;
+        if (q.find("Q4_K") != std::string::npos || q.find("Q4_0") != std::string::npos) return 2;
+        return 3;
+    };
+    std::stable_sort(discovered.begin(), discovered.end(),
+        [&](const ModelConfig& a, const ModelConfig& b) {
+            if (fmt_rank(a.format) != fmt_rank(b.format))
+                return fmt_rank(a.format) < fmt_rank(b.format);
+            if (a.format == ModelFormat::GGUF)
+                return quant_rank(a.quantization) < quant_rank(b.quantization);
+            return false;
+        });
+
+    // Phase 2.6: Unified model pool (--pool) — every model resident up front
+    if (g_pool_enabled) {
+        printf("\n── Unified Pool ──\n");
+        for (auto& m : discovered)
+            g_pool.load(m.model_path);
+        g_pool.report();
+    }
+
+    // Helper: normalize name separators for matching (hyphens/underscores → spaces)
+    auto normalize = [](std::string s) -> std::string {
+        for (auto& c : s) { if (c == '-' || c == '_') c = ' '; }
+        return s;
+    };
+    // Select model: --model flag takes priority, otherwise first discovered
+    static ModelConfig current_cfg = default_model_config();
+    if (!g_model_name.empty()) {
+        std::string user_name = normalize(g_model_name);
+        // 1. Exact match (case-sensitive)
+        for (auto& m : discovered) {
+            if (normalize(m.model_name) == user_name) {
+                printf("  (matched \"%s\" via exact → \"%s\")\n",
+                       g_model_name.c_str(), m.model_name.c_str());
+                current_cfg = m;
+                break;
+            }
+        }
+        // 2. Case-insensitive match
+        if (current_cfg.model_path.empty()) {
+            auto ci_eq = [&](const std::string& a, const std::string& b) -> bool {
+                std::string na = normalize(a), nb = normalize(b);
+                if (na.size() != nb.size()) return false;
+                for (size_t i = 0; i < na.size(); i++) {
+                    if (tolower((unsigned char)na[i]) != tolower((unsigned char)nb[i]))
+                        return false;
+                }
+                return true;
+            };
+            for (auto& m : discovered) {
+                if (ci_eq(m.model_name, g_model_name)) {
+                    printf("  (matched \"%s\" via case-insensitive → \"%s\")\n",
+                           g_model_name.c_str(), m.model_name.c_str());
+                    current_cfg = m;
+                    break;
+                }
+            }
+        }
+        // 3. Prefix match (user name is a prefix of a discovered name, normalized)
+        if (current_cfg.model_path.empty()) {
+            for (auto& m : discovered) {
+                std::string mn = normalize(m.model_name);
+                if (mn.size() >= user_name.size() &&
+                    mn.compare(0, user_name.size(), user_name) == 0) {
+                    printf("  (matched \"%s\" as prefix → \"%s\")\n",
+                           g_model_name.c_str(), m.model_name.c_str());
+                    current_cfg = m;
+                    break;
+                }
+            }
+        }
+        // 4. Case-insensitive prefix match (normalized)
+        if (current_cfg.model_path.empty()) {
+            for (auto& m : discovered) {
+                std::string mn = normalize(m.model_name);
+                if (mn.size() >= user_name.size()) {
+                    bool match = true;
+                    for (size_t i = 0; i < user_name.size(); i++) {
+                        if (tolower((unsigned char)mn[i]) !=
+                            tolower((unsigned char)user_name[i])) {
+                            match = false; break;
+                        }
+                    }
+                    if (match) {
+                        printf("  (matched \"%s\" as case-insensitive prefix → \"%s\")\n",
+                               g_model_name.c_str(), m.model_name.c_str());
+                        current_cfg = m;
+                        break;
+                    }
+                }
+            }
+        }
+        if (current_cfg.model_path.empty()) {
+            printf("  ** Model '%s' not found -- using first available.\n",
+                   g_model_name.c_str());
+        }
+    }
+    if (current_cfg.model_path.empty() && !discovered.empty()) {
+        current_cfg = discovered.front();
+    }
+
+    for (auto& m : discovered) {
+        bool sel = (m.model_name == current_cfg.model_name);
+        printf("  %s %s (%s)%s\n",
+               sel ? ">" : "v",
+               m.model_name.c_str(), m.model_path.c_str(),
+               sel ? " [active]" : "");
+    }
+    if (discovered.empty()) {
+        printf("  (no .gguf/.h1b files in %s)\n", g_weights_dir.c_str());
+    }
+
+    // Phase 3: Initialize
+    printf("\n── Initialize ──\n");
+    ModelConfig cfg = current_cfg;
+    // Prefer the model's own embedded GGUF vocab over the fixed .htok/ASCII
+    // tokenizer loaded above — correct per-model tokenization matters as
+    // much as backend routing for arbitrary (non-Zaya) models. Falls back
+    // silently (keeps whatever tokenizer was already loaded) if unavailable.
+    load_model_tokenizer(cfg.model_path);
+    BackendRoute route = select_backend_route(cfg);
+    printf("  Router: %s\n", route.reason.c_str());
+    // mgr state is read by /v1/health + /v1/models under g_config_mutex —
+    // mutate under the same lock (issue #1271).
+    bool inited;
+    {
+        std::lock_guard<std::mutex> cfg_lock(g_config_mutex);
+        inited = mgr.init(cfg, g_weights_dir, route.backend_ids_in_order);
+    }
+    if (inited) {
+        // Load vision encoder (--mmproj) for real ViT embeddings (issue #1420).
+        // Without it, image parts fall back to dummy zero embeddings.
+        if (!g_mmproj_path.empty()) {
+            if (g_mmproj_path.size() > 4 &&
+                g_mmproj_path.substr(g_mmproj_path.size() - 4) == ".1bp")
+                g_vit_ok = mage_vit_load_weights_1bp(g_mmproj_path.c_str(), g_vit);
+            else
+                g_vit_ok = g_vit.load_from_gguf(g_mmproj_path);
+            if (!g_vit_ok) {
+                fprintf(stderr, "WARNING: mmproj load failed (%s) — vision falls back to dummy embeddings\n",
+                        g_mmproj_path.c_str());
+            } else {
+                fprintf(stderr, "Vision encoder loaded: H=%d L=%d NH=%d P=%d merger=%s\n",
+                        g_vit.config.hidden_size, g_vit.config.num_layers,
+                        g_vit.config.num_heads, g_vit.config.patch_size,
+                        g_vit.mm0_w.empty() ? "no" : "yes");
+            }
+        }
+        // Select active backend from the route's ordered list (not global
+        // priority order), so the backend that matches the model format is
+        // chosen first. Without this, npu_flm (T1_ACCELERATOR priority) gets
+        // picked for every model even though it only supports Q4NX format.
+        bool selected = false;
+        for (const auto& bid : route.backend_ids_in_order) {
+            for (auto& b : mgr.backends()) {
+                if (b.id == bid && b.available && b.functional && b.instance) {
+                    mgr.select_backend(b.id);
+                    selected = true;
+                    break;
+                }
+            }
+            if (selected) break;
+        }
+        if (!selected) {
+            // Fallback: any functional backend
+            for (auto& b : mgr.backends()) {
+                if (b.available && b.functional && b.instance) {
+                    mgr.select_backend(b.id);
+                    break;
+                }
+            }
+        }
+        auto* active = mgr.active_info();
+        printf("  ✓  Active backend: %s (%s)\n",
+               active ? active->id.c_str() : "?",
+               active ? active->description.c_str() : "?");
+#ifndef _WIN32
+        // Release /dev/accel/accel0 if the NPU backend is not active.
+        // The HSA runtime opens this device during GPU backend init (even
+        // for non-NPU backends like Mamba1) as a side effect of accelerator
+        // enumeration on Strix Halo. When the NPU isn't being used, close
+        // any spurious fds so standalone tools (npu_engine_universal) can
+        // access the NPU. The GPU backends don't need it for compute.
+        // See issue #1029.
+        if (!active || active->type != BackendType::NPU_XRT) {
+            // Step 1: Close any open /dev/accel/accel* file descriptors.
+            // These are opened by the HSA runtime during GPU backend init
+            // as a side effect of accelerator enumeration on Strix Halo.
+            int n_closed = 0;
+            DIR* fddir = opendir("/proc/self/fd");
+            if (fddir) {
+                struct dirent* entry;
+                while ((entry = readdir(fddir)) != nullptr) {
+                    if (entry->d_name[0] == '.') continue;
+                    char link[256], target[128];
+                    snprintf(link, sizeof(link), "/proc/self/fd/%s", entry->d_name);
+                    ssize_t n = readlink(link, target, sizeof(target) - 1);
+                    if (n > 0) {
+                        target[n] = '\0';
+                        if (strncmp(target, "/dev/accel/accel", 16) == 0) {
+                            int fd = atoi(entry->d_name);
+                            if (fd > 2) {
+                                close(fd);
+                                n_closed++;
+                                printf("  ✓  Closed NPU fd %d (%s)\n", fd, target);
+                            }
+                        }
+                    }
+                }
+                closedir(fddir);
+            }
+
+            // Step 2 (--free-npu only): Unmap any /dev/accel/accel* memory
+            // mappings. This is risky — forcibly unmapping regions the HSA
+            // runtime may still reference can crash the process. Only enable
+            // with --free-npu when NPU coexistence is explicitly needed.
+            // The HSA runtime mmaps ~64MB from the NPU device for DMA buffers
+            // even on GPU-only workloads. Closing the fd (step 1) releases
+            // the file reference but the kernel still considers the device
+            // "in use" while any process has it mmap'd. Force-unmap those
+            // regions so the device is truly free for standalone tools.
+            // See issue #1029.
+            FILE* maps = fopen("/proc/self/maps", "r");
+            if (maps) {
+                char line[512];
+                while (fgets(line, sizeof(line), maps)) {
+                    // Parse: "7c2f74000000-7c2f78000000 rw-s ... /dev/accel/accel0"
+                    unsigned long start = 0, end = 0;
+                    char perms[8] = {0}, path[256] = {0};
+                    if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %255s",
+                               &start, &end, perms, path) >= 3) {
+                        if (strstr(path, "/dev/accel/accel") == path) {
+                            size_t len = end - start;
+                            if (munmap((void*)start, len) == 0) {
+                                n_closed++;
+                                printf("  ✓  Unmapped NPU region 0x%lx-0x%lx (%zu MB) — device %s freed\n",
+                                       start, end, len / (1024*1024), path);
+                            } else {
+                                fprintf(stderr, "  ⚠  munmap of 0x%lx failed: %s\n",
+                                        start, strerror(errno));
+                            }
+                        }
+                    }
+                }
+                fclose(maps);
+            }
+
+            if (n_closed > 0) {
+                printf("  ✓  NPU device released (%d handles) — free for standalone tools\n", n_closed);
+            }
+        }
+#endif
+
+    // ── Speculative-decode draft model (--draft-model) ──
+    // A second, smaller ggml-vulkan backend kept side-by-side with the main
+    // model. The draft proposes tokens; the main backend verifies them in
+    // batches (see run_spec_decode). Falls back silently if unsupported.
+    if (!g_draft_model_path.empty()) {
+        FILE* f = fopen(g_draft_model_path.c_str(), "rb");
+        if (!f) {
+            printf("  ⚠  --draft-model not found: %s (speculative decode disabled)\n",
+                   g_draft_model_path.c_str());
+        } else {
+            fclose(f);
+            ModelConfig dcfg = cfg;
+            dcfg.model_path = g_draft_model_path;
+            g_draft_backend = create_ggml_vulkan_backend();
+            if (g_draft_backend && g_draft_backend->init(dcfg, g_weights_dir)) {
+                printf("  ✓  Draft model: %s (speculative decode ready)\n",
+                       g_draft_model_path.c_str());
+            } else {
+                if (g_draft_backend) { g_draft_backend->destroy(); delete g_draft_backend; }
+                g_draft_backend = nullptr;
+                printf("  ⚠  Draft model load failed: %s (speculative decode disabled)\n",
+                       g_draft_model_path.c_str());
+            }
+        }
+    }
+
+    } else {
+        printf("  ⚠  No backend initialized (weights missing or no hardware)\n");
+        printf("     Server starts in discovery-only mode.\n");
+    }
+
+    // Phase 4: Benchmark — skipped. DynamicRouter is ready with active backends.
+    // Benchmarks can be triggered at runtime via the API.
+    if (inited) {
+        printf("\n── DynamicRouter Ready ──\n");
+        mgr.router().report();
+        printf("  ➤ Set strategy: curl -X POST http://localhost:%d/v1/strategy/select -d '{\"strategy\":\"gpu_only\"}'\n", g_port);
+        printf("  ➤ Generate:     curl http://localhost:%d/v1/completions -d '{\"prompt\":\"Hello\",\"max_tokens\":8}'\n", g_port);
+    }
+
+    // ── Phase 5: Initialize Strategy Engine ──
+    printf("\n── Strategy Engine ──\n");
+    {
+        auto perf_table = build_performance_table(mgr, current_cfg.model_name);
+        printf("  Performance table (%zu backends):\n", perf_table.size());
+        for (auto& r : perf_table) {
+            printf("    %-20s -> %-12s (%.0f tok/s)\n",
+                   r.model_pattern.c_str(), r.backend.c_str(), r.speed_tok_s);
+        }
+        // Default to adaptive strategy (the "true agent")
+        g_strategy_engine.init("adaptive", mgr, perf_table);
+        printf("  Active strategy: %s\n", g_strategy_engine.name());
+        printf("     Per-token routing: set X-Router-Strategy header\n");
+        printf("     Change at runtime: POST /v1/strategy/select\n");
+        printf("     Status:            GET /v1/router\n");
+    }
+
+    // ── Phase 6: Start Agent Watchdog ──
+    // NOTE: Disabled pending investigation of heap corruption (issue #932).
+    // The watchdog thread races with httplib completion handlers when it
+    // calls benchmark_all() while a generate() call is in progress.
+    // printf("\n── Agent Watchdog ──\n");
+    // {
+    //     if (!g_watchdog) {
+    //         g_watchdog = new AgentWatchdog(g_strategy_engine, mgr);
+    //     }
+    //     g_watchdog->start();
+    // }
+
+    // Quick mode: re-profile in background after server starts
+    if (quick_mode) {
+        printf("  ⚡ Quick mode: full benchmark deferred to background\n");
+    }
+
+    // ── Batch scheduler (issue #1511) ──
+    if (g_batch_slots > 1) {
+        printf("\n── Batch Decode: %d slots ──\n", g_batch_slots);
+        auto* be = mgr.active_backend();
+        int hw_max = be ? be->max_batch_slots() : 1;
+        if (g_batch_slots > hw_max) {
+            printf("  backend supports max %d slots, clamping\n", hw_max);
+            g_batch_slots = hw_max;
+        }
+        g_batch_scheduler = std::make_unique<BatchScheduler>(
+            g_batch_slots,
+            [&](const std::vector<std::pair<int,int>>& st) -> std::vector<int> {
+                std::lock_guard<std::mutex> lk(g_inference_mutex);
+                auto* b = mgr.active_backend();
+                return b ? b->generate_batch(st) : std::vector<int>{};
+            },
+            [&](int tok) -> int {
+                return mgr.generate(tok);
+            },
+            [&](int slot) -> bool {
+                auto* b = mgr.active_backend();
+                return b ? b->reset_slot(slot) : false;
+            }
+        );
+    }
+
+    // ── HTTP Server ──
+    httplib::Server svr;
+
+    // Any unexpected exception returns a clean 500 — never the raw exception
+    // text in an EXCEPTION_WHAT header (issue #1293).
+    svr.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr) {
+        res.status = 500;
+        res.set_content("{\"error\":\"Internal server error\"}", "application/json");
+    });
+
+    // Limit request body size to prevent memory exhaustion from oversized payloads
+    svr.set_payload_max_length(16 * 1024 * 1024); // 16 MiB
+
+    // ── CORS middleware (only enabled when --cors-origin is set) ──
+    if (!g_cors_origin.empty()) {
+        svr.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
+            if (req.method == "OPTIONS") {
+                res.set_header("Access-Control-Allow-Origin", g_cors_origin);
+                if (g_cors_origin == "*") {
+                    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                    res.set_header("Access-Control-Allow-Headers", "Content-Type, X-Backend, X-Strategy, Authorization");
+                }
+                res.status = 204;
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+    }
+
+    auto add_cors = [&](httplib::Response& res) {
+        if (!g_cors_origin.empty())
+            res.set_header("Access-Control-Allow-Origin", g_cors_origin);
+    };
+
+    // ── GET /v1/health — Backend status dashboard ──
+    svr.Get("/v1/health", [&](const httplib::Request&, httplib::Response& res) {
+        // Lock both mutexes consistently — health reads mgr backends (g_config_mutex)
+        // and strategy state (g_strategy_mutex).
+        std::lock(g_config_mutex, g_strategy_mutex);
+        std::lock_guard<std::mutex> _l1(g_config_mutex, std::adopt_lock);
+        std::lock_guard<std::mutex> _l2(g_strategy_mutex, std::adopt_lock);
+        json j = health_json(mgr);
+        j["version"] = "unified-server-1.0";
+        j["model"] = current_cfg.model_name;
+        j["weights_dir"] = g_weights_dir;
+        j["uptime"] = std::to_string(time(nullptr)) + "s";
+        j["generation_timeout_ms"] = g_generation_timeout_ms;
+        res.set_content(j.dump(2), "application/json");
+        add_cors(res);
+    });
+
+    // ── GET /v1/models — List models ──
+    svr.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
+        std::lock(g_config_mutex, g_strategy_mutex);
+        std::lock_guard<std::mutex> _l1(g_config_mutex, std::adopt_lock);
+        std::lock_guard<std::mutex> _l2(g_strategy_mutex, std::adopt_lock);
+        auto* active = mgr.active_info();
+        json j;
+        j["object"] = "list";
+        json models = json::array();
+        // Add all discovered models
+        for (auto& m : discovered) {
+            json info;
+            info["id"] = m.model_name;
+            info["object"] = "model";
+            info["created"] = 0;
+            info["owned_by"] = "1bit-systems";
+            info["backend"] = "auto";
+            info["pooled"] = g_pool_enabled && g_pool.has_path(m.model_path);
+            info["details"] = {{
+                {"hidden", m.hidden}, {"layers", m.n_layers},
+                {"heads", m.n_heads}, {"kv_heads", m.n_kv_heads},
+                {"vocab", m.vocab}, {"max_seq_len", m.max_seq_len}
+            }};
+            models.push_back(info);
+        }
+        // Also add the active backend model if different
+        if (active) {
+            bool found = false;
+            for (auto& m : discovered) {
+                if (m.model_name == active->id) { found = true; break; }
+            }
+            if (!found) models.push_back(model_info_json(active, current_cfg.model_name));
+        }
+        j["data"] = models;
+        res.set_content(j.dump(2), "application/json");
+        add_cors(res);
+    });
+
+    // ── POST /v1/pool — Unified pool report (control plane) ──
+    svr.Post("/v1/pool", [&](const httplib::Request&, httplib::Response& res) {
+        json j;
+        j["enabled"] = g_pool_enabled;
+        j["resident"] = g_pool.count();
+        j["total_mb"] = 0.0;
+        json slots = json::array();
+        for (int i = 0; i < g_pool.count(); i++) {
+            auto* s = g_pool.get(i);
+            if (!s) continue;
+            json sj;
+            sj["name"] = s->name;
+            sj["kind"] = s->kind;
+            sj["mb"] = (double)s->mmap_size / 1024 / 1024;
+            sj["resident"] = s->mmap_data != nullptr;
+            j["total_mb"] = j["total_mb"].get<double>() + sj["mb"].get<double>();
+            slots.push_back(sj);
+        }
+        j["slots"] = slots;
+        res.set_content(j.dump(2), "application/json");
+        add_cors(res);
+    });
+
+    // ── POST /v1/chat/completions — OpenAI-compatible chat ──
+    // Uses the strategy engine for per-token routing when X-Router-Strategy
+    // header is set, or falls back to single-backend selection.
+    svr.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            json err = {{"error", "Invalid JSON body"}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        std::string backend_id = resolve_backend_id(req);
+        SelectionStrategy strategy = resolve_strategy(req);
+
+        // Check for strategy engine routing
+        std::string strategy_name = resolve_strategy_name(req);
+        bool use_strategy_engine = !strategy_name.empty();
+
+        // Extract messages and build prompt + user message for content routing
+        std::string prompt;
+        std::string last_user_msg;
+        struct MsgPair { std::string role; std::string content; };
+        std::vector<MsgPair> chat_msgs;
+        std::vector<VlProcessor> vision_images;  // holds processed images from content parts
+        // nlohmann throws (type_error 305/306/302) on non-object messages and
+        // content parts — catch and 400 instead of a bare 500 (issue #1293).
+        try {
+        if (body.contains("messages") && body["messages"].is_array()) {
+            for (auto& msg : body["messages"]) {
+                if (!msg.is_object()) {
+                    res.status = 400;
+                    res.set_content("{\"error\":\"each message must be an object\"}", "application/json");
+                    return;
+                }
+                std::string role = msg.value("role", "user");
+                std::string content;
+                if (msg["content"].is_string()) {
+                    content = msg["content"].get<std::string>();
+                } else if (msg["content"].is_array()) {
+                    for (auto& part : msg["content"]) {
+                        if (part.is_string()) {  // OpenAI allows bare strings in content arrays
+                            content += part.get<std::string>();
+                            continue;
+                        }
+                        if (!part.is_object()) continue;
+                        if (part.value("type", "") == "text") {
+                            const auto& t = part["text"];
+                            if (t.is_string()) content += t.get<std::string>();
+                        } else if (part.value("type", "") == "image_url") {
+                            // Load + process image for VL models.
+                            // This stores processed pixels; the actual ViT
+                            // forward pass happens in generate_completion()
+                            // when it detects vision_state has data.
+                            std::string url;
+                            const auto& iu = part["image_url"];
+                            if (iu.is_string()) url = iu.get<std::string>();
+                            else if (iu.is_object() && iu.contains("url")) url = iu["url"].get<std::string>();
+                            if (!url.empty()) {
+                                std::vector<unsigned char> raw;
+                                if (vl_is_data_url(url)) {
+                                    raw = vl_decode_base64_image(url);
+                                } else {
+                                    raw = vl_download_image(url);
+                                }
+                                if (!raw.empty()) {
+                                    VlProcessor vp;
+                                    if (vp.load_from_memory(raw.data(), raw.size(), 224, 224,
+                                                             VL_MEAN_QWEN2VL, VL_STD_QWEN2VL)) {
+                                        vision_images.push_back(std::move(vp));
+                                        content += "[image]"; // placeholder in text
+                                        fprintf(stderr, "[vision] loaded image: %dx%d -> %dx%d\n",
+                                                vp.orig_width(), vp.orig_height(),
+                                                vp.width(), vp.height());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                prompt += role + ": " + content + "\n";
+                chat_msgs.push_back({role, content});
+                if (role == "user") last_user_msg = content;
+            }
+        } else if (body.contains("prompt") && body["prompt"].is_string()) {
+            prompt = body["prompt"].get<std::string>();
+            last_user_msg = prompt;
+        }
+        } catch (const json::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", std::string(e.what())}}).dump(), "application/json");
+            return;
+        }
+
+        int max_tokens = body.value("max_tokens", 256);
+        if (max_tokens < 1) max_tokens = 1;
+        if (max_tokens > 32768) max_tokens = 32768;
+        // Optional conversation id: enables multi-turn KV reuse in text-level
+        // backends (FLM) — continuation turns send only the delta instead of
+        // re-prefilling the full history. Omit it for stateless behavior.
+        std::string session_id = body.value("session_id", "");
+        int top_k = body.value("top_k", 0);
+        if (top_k < 0) top_k = 0;
+        // temperature<=0 is greedy (OpenAI convention); default to 0.8 when
+        // unset — greedy argmax makes small models loop (zaya defaults were
+        // 0.8/0.95/1.1 for the same reason).
+        float temperature = body.value("temperature", 0.8f);
+        if (temperature < 0.0f) temperature = 0.0f;
+        if (temperature > 5.0f) temperature = 5.0f;
+        float repeat_penalty = body.value("repetition_penalty", 1.1f);
+        float top_p = body.value("top_p", 0.95f);
+        std::string req_model = body.value("model", "");
+        if (req_model.empty()) req_model = current_cfg.model_name;  // default model
+
+        // ── Chat template (per-arch, mirrors zaya_server build_chatml) ──
+        // Instruct models need their native template: raw "role: content"
+        // text makes Qwen/Llama/Zamba2 instruct models echo the prompt back
+        // instead of answering (their chat tokens are special ids, not bytes).
+        // Base models (no "Instruct" in the name) keep the raw format.
+        bool is_instruct = req_model.find("Instruct") != std::string::npos;
+        if (is_instruct && !chat_msgs.empty()) {
+            bool llama_tpl = false;
+            for (auto& dm : discovered) {
+                if (dm.model_name == req_model) {
+                    llama_tpl = (dm.architecture == "llama");
+                    break;
+                }
+            }
+            std::string tpl;
+            for (auto& m : chat_msgs) {
+                if (llama_tpl)
+                    tpl += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n" + m.content + "<|eot_id|>\n";
+                else
+                    tpl += "<|im_start|>" + m.role + "\n" + m.content + "<|im_end|>\n";
+            }
+            tpl += llama_tpl ? "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                             : "<|im_start|>assistant\n";
+            prompt = tpl;
+        }
+
+        // ── Serialize all compute against the single shared backend context ──
+        // Everything below — mgr.set_strategy, the mgr.init model switch, the
+        // vision mgr.generate/forward_embed injection, and generate_completion's
+        // mgr.reset/mgr.generate loop — mutates one BackendManager inference
+        // state. Concurrent requests here race on the KV cache / active-backend
+        // pointer (AUDIT_ISSUES.md #2). Held to the end of the handler; the short
+        // g_config_mutex / g_strategy_mutex sections below nest *inside* it.
+        // Metadata endpoints (/v1/health, /v1/models) take only config+strategy,
+        // so they are NOT blocked by an in-flight decode — preserving the #701
+        // goal of keeping health responsive during generation.
+        std::lock_guard<std::mutex> infer_lock(g_inference_mutex);
+
+        // ── Phase 1: Model-switch check under locks only (#701 fix) ──
+        // Defer slow I/O (load_from_gguf, mgr.init) to outside the config lock.
+        mgr.set_strategy(strategy);
+
+        ModelConfig switch_cfg;
+        bool need_model_switch = false;
+        {
+            std::lock(g_config_mutex, g_strategy_mutex);
+            std::lock_guard<std::mutex> _l1(g_config_mutex, std::adopt_lock);
+            std::lock_guard<std::mutex> _l2(g_strategy_mutex, std::adopt_lock);
+
+            if (!req_model.empty()) {
+                for (auto& dm : discovered) {
+                    if (dm.model_name == req_model &&
+                        (dm.hidden != current_cfg.hidden || dm.n_layers != current_cfg.n_layers)) {
+                        printf("[model] switching to %s (%d layers, %d hidden)\n",
+                               dm.model_name.c_str(), dm.n_layers, dm.hidden);
+                        switch_cfg = dm;
+                        current_cfg = dm;
+                        need_model_switch = true;
+                        break;
+                    }
+                }
+            }
+        } // release both mutexes
+
+        // ── Phase 1b: Model-switch I/O outside locks (#701 fix) ──
+        if (need_model_switch) {
+            load_model_tokenizer(switch_cfg.model_path);
+            BackendRoute swrt = select_backend_route(switch_cfg);
+            mgr.init(switch_cfg, g_weights_dir, swrt.backend_ids_in_order);
+        }
+
+        // Tokenize with logprobs for cascade strategy (#696 fix: config_mutex only)
+        std::vector<int> prompt_tokens;
+        std::vector<double> prompt_logprobs;
+        {
+            std::lock_guard<std::mutex> cfg_lock(g_config_mutex);
+            if (use_strategy_engine) {
+                prompt_tokens = g_tokenizer.encode_with_logprobs(prompt, prompt_logprobs);
+            } else {
+                prompt_tokens = g_tokenizer.encode(prompt);
+            }
+            if (prompt_tokens.empty()) {
+                prompt_tokens = {g_tokenizer.bos_id};
+            }
+        }
+
+        // Capture strategy engine pointer under its mutex (#696 fix)
+        StrategyEngine* se = nullptr;
+        {
+            std::lock_guard<std::mutex> strat_lock(g_strategy_mutex);
+            se = use_strategy_engine ? &g_strategy_engine : nullptr;
+        }
+        // ── Inject vision embeddings (if any) before text generation ──
+        // Runs forward_embed() for each vision token, splicing the image into
+        // the KV cache before the text prompt is processed.
+        // This path activates when the message content includes image_url parts.
+        // For full ViT forward (mmproj GGUF), use tools/vision_server.cpp.
+        if (!vision_images.empty()) {
+            auto* active = mgr.active_info();
+            int hidden = (active && active->instance) ? active->instance->cfg.hidden : 2048;
+            if (hidden <= 0) hidden = 2048;
+
+            // Wrap vision tokens with <|vision_start|> / <|vision_end|>
+            // (Qwen2-VL convention: token IDs 151652/151653)
+            const int VISION_START = 151652;
+            const int VISION_END   = 151653;
+            const int VISION_TOKENS_PER_IMG = 64; // 16x16 patches / 4 merger
+
+            mgr.generate(VISION_START);
+            if (g_vit_ok) {
+                // Real ViT forward: pixels -> mage_vit_forward (patch embed +
+                // transformer + 2x2 merger + projector) -> text-hidden
+                // embeddings, one forward_embed per token (issue #1420).
+                size_t n_embeds = 0;
+                for (auto& vp : vision_images) {
+                    std::vector<float> embs = mage_vit_forward(
+                        g_vit, vp.pixels(), 3, 1, vp.height(), vp.width(), 1);
+                    if (embs.empty()) {
+                        fprintf(stderr, "[vision] ViT forward produced no embeddings — skipping image\n");
+                        continue;
+                    }
+                    // Projector output dim: merger mlp.2 rows (mm0 is [4H, 4H]
+                    // -> mlp.2 is [th, 4H]) when a merger exists, else tower hidden.
+                    int th = g_vit.config.hidden_size;
+                    if (!g_vit.mm0_w.empty() && !g_vit.mm2_w.empty()) {
+                        int pm = (int)(g_vit.mm0_w.size() / (4 * g_vit.config.hidden_size));
+                        if (pm > 0) th = (int)(g_vit.mm2_w.size() / pm);
+                    }
+                    if (th <= 0) {
+                        fprintf(stderr, "[vision] invalid projector output dim — skipping image\n");
+                        continue;
+                    }
+                    if (th != hidden) {
+                        fprintf(stderr, "[vision] WARNING: projector dim %d != text hidden %d — mismatched mmproj/model pair?\n",
+                                th, hidden);
+                    }
+                    int n_tiles = (int)(embs.size() / th);
+                    std::vector<float> tok(hidden, 0.0f);
+                    for (int i = 0; i < n_tiles && active && active->instance; i++) {
+                        const float* e = embs.data() + (size_t)i * th;
+                        if (th == hidden) {
+                            active->instance->forward_embed(e);
+                        } else {
+                            int n = std::min(th, hidden);
+                            std::copy(e, e + n, tok.data());
+                            active->instance->forward_embed(tok.data());
+                        }
+                        n_embeds++;
+                    }
+                }
+                fprintf(stderr, "[vision] injected %zu images (%zu real ViT embeddings)\n",
+                        vision_images.size(), n_embeds);
+            } else {
+                // No mmproj: feed zeros — the KV cache advances but content is
+                // dummy (historical behavior, kept as fallback).
+                std::vector<float> embed_buf(hidden, 0.0f);
+                for (auto& vp : vision_images) {
+                    (void)vp;
+                    for (int t = 0; t < VISION_TOKENS_PER_IMG; t++) {
+                        if (active && active->instance) {
+                            active->instance->forward_embed(embed_buf.data());
+                        }
+                    }
+                }
+                fprintf(stderr, "[vision] injected %zu images (%d dummy embeddings — pass --mmproj for real ViT)\n",
+                        vision_images.size(), VISION_TOKENS_PER_IMG);
+            }
+            mgr.generate(VISION_END);
+        }
+
+        // Generate with strategy-aware routing (#696 fix: no global lock held)
+        json gen_result = generate_completion(mgr, prompt_tokens, prompt_logprobs,
+                                               max_tokens, backend_id,
+                                               se, last_user_msg,
+                                               temperature, top_k, prompt, repeat_penalty, top_p,
+                                               session_id);
+
+        // Build OpenAI-compatible response
+        json response;
+        response["id"] = "cmpl-" + std::to_string(time(nullptr));
+        response["object"] = "chat.completion";
+        response["created"] = time(nullptr);
+        response["model"] = current_cfg.model_name;
+
+        json choice;
+        choice["index"] = 0;
+        json message;
+        message["role"] = "assistant";
+        message["content"] = gen_result.value("text", "");
+        std::string finish_reason = "stop";
+        if (gen_result.value("timed_out", false)) {
+            finish_reason = "timeout";
+        } else if (gen_result.contains("error")) {
+            finish_reason = "error";
+        }
+        choice["message"] = message;
+        choice["finish_reason"] = finish_reason;
+
+        json usage;
+        usage["prompt_tokens"] = (int)prompt_tokens.size();
+        usage["completion_tokens"] = gen_result.value("gen_tokens", 0);
+        usage["total_tokens"] = (int)prompt_tokens.size() + gen_result.value("gen_tokens", 0);
+
+        response["choices"] = json::array({choice});
+        response["usage"] = usage;
+
+        // Add routing metadata as headers
+        res.set_header("X-Backend-Id", gen_result.value("backend_used", "unknown"));
+        res.set_header("X-Strategy", gen_result.value("strategy", "none"));
+        char tok_s_buf[32];
+        snprintf(tok_s_buf, sizeof(tok_s_buf), "%.1f", gen_result.value("tok_s", 0.0f));
+        res.set_header("X-Backend-Tok-s", tok_s_buf);
+
+        // Include per-token backend info when using strategy engine
+        if (use_strategy_engine && gen_result.contains("per_token_backend")) {
+            response["per_token_backend"] = gen_result["per_token_backend"];
+        }
+
+        // error_handler_t::replace: decoded model text isn't guaranteed valid
+        // UTF-8 (byte-level BPE tokenizers like blackmamba's GPT-NeoX-20B
+        // .htok can decode to a stray byte sequence at a token boundary) --
+        // strict (default) dump() throws type_error.316, which previously
+        // escaped as an uncaught exception -> empty 500, no app-level log line.
+        res.set_content(response.dump(2, ' ', false, json::error_handler_t::replace), "application/json");
+        add_cors(res);
+
+        // Log to stdout
+        printf("  [%s] %d tokens → %d tokens (%.1f tok/s, backend: %s, strategy: %s)\n",
+               backend_id.c_str(),
+               (int)prompt_tokens.size(),
+               gen_result.value("gen_tokens", 0),
+               gen_result.value("tok_s", 0.0f),
+               gen_result.value("backend_used", "?").c_str(),
+               gen_result.value("strategy", "none").c_str());
+    });
+
+    // ── POST /v1/completions — Legacy completion endpoint ──
+    svr.Post("/v1/completions", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            json err = {{"error", "Invalid JSON body"}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        std::string backend_id = resolve_backend_id(req);
+
+        // Serialize compute against the single shared backend context, exactly
+        // as /v1/chat/completions does (AUDIT_ISSUES.md #2). Held across
+        // set_strategy + tokenize + generate_completion; the g_config_mutex
+        // tokenize section below nests inside it.
+        std::lock_guard<std::mutex> infer_lock(g_inference_mutex);
+
+        mgr.set_strategy(resolve_strategy(req));
+
+        // ── Model-switch from body["model"], same as /v1/chat/completions ──
+        // Fixes the bug where /v1/completions silently ignored the model field
+        // and always used whatever backend was last loaded.
+        std::string req_model = body.value("model", "");
+        ModelConfig switch_cfg;
+        bool need_model_switch = false;
+        {
+            std::lock(g_config_mutex, g_strategy_mutex);
+            std::lock_guard<std::mutex> _l1(g_config_mutex, std::adopt_lock);
+            std::lock_guard<std::mutex> _l2(g_strategy_mutex, std::adopt_lock);
+
+            if (!req_model.empty()) {
+                for (auto& dm : discovered) {
+                    if (dm.model_name == req_model &&
+                        (dm.hidden != current_cfg.hidden || dm.n_layers != current_cfg.n_layers)) {
+                        printf("[model] /v1/completions switching to %s (%d layers, %d hidden)\n",
+                               dm.model_name.c_str(), dm.n_layers, dm.hidden);
+                        switch_cfg = dm;
+                        current_cfg = dm;
+                        need_model_switch = true;
+                        break;
+                    }
+                }
+            }
+        } // release both mutexes
+
+        // ── Model-switch I/O outside locks (#701 fix) ──
+        if (need_model_switch) {
+            load_model_tokenizer(switch_cfg.model_path);
+            BackendRoute swrt = select_backend_route(switch_cfg);
+            mgr.init(switch_cfg, g_weights_dir, swrt.backend_ids_in_order);
+        }
+
+        // ── Tokenize under config_mutex only (#696 fix) ──
+        std::vector<int> prompt_tokens;
+        std::string raw_prompt;
+        {
+            std::lock_guard<std::mutex> cfg_lock(g_config_mutex);
+            if (body.contains("tokens") && body["tokens"].is_array()) {
+                for (auto& t : body["tokens"]) {
+                    if (t.is_number_integer()) prompt_tokens.push_back(t.get<int>());
+                }
+            } else if (body.contains("prompt") && body["prompt"].is_string()) {
+                try {
+                    raw_prompt = body["prompt"].get<std::string>();
+                    prompt_tokens = g_tokenizer.encode(raw_prompt);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[completions] encode error: %s\n", e.what());
+                }
+            }
+            if (prompt_tokens.empty()) {
+                prompt_tokens = {g_tokenizer.bos_id};
+            }
+        }
+
+        int max_tokens = body.value("max_tokens", 256);
+        if (max_tokens < 1) max_tokens = 1;
+        if (max_tokens > 32768) max_tokens = 32768;
+        int top_k = body.value("top_k", 0);
+        if (top_k < 0) top_k = 0;
+        float temperature = body.value("temperature", 0.8f);
+        if (temperature < 0.0f) temperature = 0.0f;
+        if (temperature > 5.0f) temperature = 5.0f;
+        float repeat_penalty = body.value("repetition_penalty", 1.1f);
+        float top_p = body.value("top_p", 0.95f);
+        // Optional conversation id: multi-turn KV reuse for text-level
+        // backends (FLM) — see the /v1/chat/completions handler.
+        std::string session_id = body.value("session_id", "");
+
+        json gen_result;
+
+        if (g_batch_scheduler) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto fut = g_batch_scheduler->submit(prompt_tokens, max_tokens,
+                                                  temperature, top_k,
+                                                  g_tokenizer.eos_id);
+            std::vector<int> out_tokens;
+            try {
+                out_tokens = fut.get();
+            } catch (const std::exception& e) {
+                json err_resp = {{"error", std::string("Batch decode failed: ") + e.what()}};
+                res.status = 500;
+                res.set_content(err_resp.dump(), "application/json");
+                return;
+            }
+            float ms = std::chrono::duration<float, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            std::string text = g_tokenizer.decode(out_tokens);
+            gen_result["tokens"] = out_tokens;
+            gen_result["text"] = text;
+            gen_result["gen_ms"] = ms;
+            gen_result["gen_tokens"] = (int)out_tokens.size();
+            gen_result["tok_s"] = out_tokens.empty() ? 0.0f : (float)out_tokens.size() / (ms / 1000.0f);
+            gen_result["backend_used"] = "batched";
+            gen_result["batch_slots"] = g_batch_slots;
+        } else {
+            std::vector<double> empty_logprobs;
+            try {
+                gen_result = generate_completion(mgr, prompt_tokens, empty_logprobs, max_tokens, backend_id,
+                                                 nullptr, "", temperature, top_k, raw_prompt, repeat_penalty, top_p,
+                                                 session_id);
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[completions] generate error: %s\n", e.what());
+                gen_result = {{"error", std::string("Generation failed: ") + e.what()}};
+            } catch (...) {
+                fprintf(stderr, "[completions] unknown error\n");
+                gen_result = {{"error", "Generation failed: unknown error"}};
+            }
+        }
+
+        if (gen_result.contains("error")) {
+            json err_resp = {{"error", gen_result["error"]}};
+            res.status = 500;
+            res.set_content(err_resp.dump(), "application/json");
+            return;
+        }
+
+        json response;
+        response["tokens"] = gen_result["tokens"];
+        response["text"] = gen_result.value("text", "");
+        response["gen_ms"] = gen_result.value("gen_ms", 0);
+        response["tok_s"] = gen_result.value("tok_s", 0.0f);
+        response["backend_used"] = gen_result.value("backend_used", "unknown");
+        if (gen_result.contains("batch_slots"))
+            response["batch_slots"] = gen_result["batch_slots"];
+
+        res.set_header("X-Backend-Id", gen_result.value("backend_used", "unknown"));
+        res.set_content(response.dump(2, ' ', false, json::error_handler_t::replace), "application/json");
+        add_cors(res);
+    });
+
+    // ── GET /v1/router — Strategy engine status ──
+    svr.Get("/v1/router", [&](const httplib::Request&, httplib::Response& res) {
+        json j;
+        // Lock strategy mutex for consistent read of strategy state + watchdog (fixes #364)
+        std::lock_guard<std::mutex> lock(g_strategy_mutex);
+        j["strategy"] = g_strategy_engine.name();
+        j["state"] = json::parse(g_strategy_engine.state_json());
+        j["watchdog_running"] = g_watchdog ? g_watchdog->running() : false;
+
+        // Add backend metrics
+        json backends = json::array();
+        for (auto* pm : mgr.monitor_stats()->all_metrics()) {
+            json bj;
+            bj["id"] = pm->backend_id;
+            bj["inferences"] = pm->inferences.load();
+            bj["failures"] = pm->failures.load();
+            bj["fallbacks"] = pm->fallbacks.load();
+            bj["tokens_per_second"] = pm->tokens_per_second.load();
+            bj["avg_ms"] = pm->recent_ms.avg();
+            bj["p50_ms"] = pm->recent_ms.p50();
+            bj["p95_ms"] = pm->recent_ms.p95();
+            bj["healthy"] = pm->healthy.load();
+            backends.push_back(bj);
+        }
+        j["backends"] = backends;
+
+        res.set_content(j.dump(2), "application/json");
+        add_cors(res);
+    });
+
+    // ── POST /v1/strategy/select — Change strategy at runtime ──
+    svr.Post("/v1/strategy/select", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            json err = {{"error", "Invalid JSON body"}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        std::string name = body.value("strategy", "");
+        if (name.empty()) {
+            json err = {{"error", "Missing 'strategy' field"}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        // Build performance table for strategy init
+        auto perf_table = build_performance_table(mgr, current_cfg.model_name);
+        // Lock strategy mutex while reinitializing the engine (fixes #364)
+        std::lock_guard<std::mutex> lock(g_strategy_mutex);
+        bool ok = g_strategy_engine.init(name, mgr, perf_table);
+
+        json j;
+        j["ok"] = ok;
+        j["strategy"] = name;
+        j["state"] = json::parse(g_strategy_engine.state_json());
+        res.set_content(j.dump(2), "application/json");
+        add_cors(res);
+    });
+
+    // ── POST /v1/backend/select — Manually select backend ──
+    svr.Post("/v1/backend/select", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            json err = {{"error", "Invalid JSON body"}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        std::string backend_id = body.value("backend", "");
+        bool ok = false;
+        json j;
+        {
+            // mgr.select_backend() mutates the shared active-backend pointer
+            // that generate_completion() also flips mid-decode. Guard it with
+            // the SAME g_inference_mutex the decode path holds (not g_config_mutex,
+            // which the decode path no longer holds since the #696 change), so a
+            // backend switch can't land in the middle of a live generate
+            // (AUDIT_ISSUES.md #2).
+            std::lock_guard<std::mutex> lock(g_inference_mutex);
+            if (!backend_id.empty()) {
+                ok = mgr.select_backend(backend_id);
+            }
+            j["ok"] = ok;
+            j["selected"] = backend_id;
+            if (ok) {
+                auto* active = mgr.active_info();
+                j["active_backend"] = active ? active->id : "none";
+                j["active_type"] = active ? backend_name(active->type) : "none";
+            } else {
+                j["error"] = "Backend '" + backend_id + "' not found or not functional";
+            }
+        }
+        res.set_content(j.dump(2), "application/json");
+        add_cors(res);
+    });
+
+    // ── GET /v1/backend/status — Full backend report ──
+    svr.Get("/v1/backend/status", [&](const httplib::Request&, httplib::Response& res) {
+        json j;
+        // g_strategy_mutex alone (fixes #364) only protects g_strategy_engine
+        // + g_watchdog — mgr itself (report/backends/active_info/
+        // active_backend, all read below) is the inference handlers'
+        // g_config_mutex's responsibility. Reading mgr here under a
+        // different mutex than the one that guards it during an in-flight
+        // inference call doesn't actually serialize anything (fixes #2).
+        // std::lock (not two separate lock_guards) avoids a lock-order
+        // deadlock against any other path that might acquire the same two
+        // mutexes in the opposite order.
+        std::lock(g_config_mutex, g_strategy_mutex);
+        std::lock_guard<std::mutex> lock1(g_config_mutex, std::adopt_lock);
+        std::lock_guard<std::mutex> lock2(g_strategy_mutex, std::adopt_lock);
+        j["strategy"] = g_strategy_engine.name();
+        j["watchdog_running"] = g_watchdog ? g_watchdog->running() : false;
+        j["report"] = mgr.report();
+
+        json backends = json::array();
+        for (auto& b : mgr.backends()) {
+            json bj;
+            bj["id"] = b.id;
+            bj["type"] = backend_name(b.type);
+            bj["tier"] = tier_name(b.tier);
+            bj["available"] = b.available;
+            bj["functional"] = b.functional;
+            bj["score_ms_per_tok"] = b.score;
+            bj["priority"] = b.priority;
+            bj["total_inferences"] = b.total_inferences;
+            bj["failed_inferences"] = b.failed_inferences;
+            bj["cumulative_ms"] = b.cumulative_ms;
+            backends.push_back(bj);
+        }
+        j["backends"] = backends;
+
+        auto* active = mgr.active_info();
+        if (active) j["active"] = active->id;
+        else j["active"] = "none";
+
+        j["initialized"] = mgr.active_backend() != nullptr;
+        j["weights_dir"] = g_weights_dir;
+
+        res.set_content(j.dump(2), "application/json");
+        add_cors(res);
+    });
+
+    // ---- GET / --- Root health check ----
+    svr.Get("/", [&](const httplib::Request&, httplib::Response& res) {
+        json j;
+        j["service"] = "1bit.systems --- One binary, all backends, intelligent routing";
+        j["version"] = "1.0";
+        // See /v1/backend/status above: mgr.active_backend() needs
+        // g_config_mutex, not just g_strategy_mutex (fixes #2/#364).
+        std::lock(g_config_mutex, g_strategy_mutex);
+        std::lock_guard<std::mutex> lock1(g_config_mutex, std::adopt_lock);
+        std::lock_guard<std::mutex> lock2(g_strategy_mutex, std::adopt_lock);
+        j["status"] = mgr.active_backend() ? "ready" : "initializing";
+        j["strategy"] = g_strategy_engine.name();
+        j["endpoints"] = {
+            "/v1/health",
+            "/v1/models",
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/router",
+            "/v1/strategy/select",
+            "/v1/backend/select",
+            "/v1/backend/status"
+        };
+        res.set_content(j.dump(2), "application/json");
+        add_cors(res);
+    });
+
+    // ── Start server ──
+    printf("\n──────────────────────────────────────────────\n");
+    printf("  1bit.systems — Agent Inference Server\n");
+    printf("──────────────────────────────────────────────\n");
+    printf("  Port:    %d\n", g_port);
+    printf("  Backend: %s\n", mgr.active_info() ? mgr.active_info()->id.c_str() : "none");
+    printf("  Strategy: %s\n", g_strategy_engine.name());
+    printf("  Watchdog: %s\n", (g_watchdog && g_watchdog->running()) ? "running" : "stopped");
+    printf("──────────────────────────────────────────────\n");
+    printf("  Endpoints:\n");
+    printf("    GET  /v1/health            — Backend status + metrics\n");
+    printf("    GET  /v1/models            — List available models\n");
+    printf("    POST /v1/pool              — Unified pool report\n");
+    printf("    POST /v1/chat/completions  — Chat with strategy routing\n");
+    printf("    POST /v1/completions       — Legacy completion\n");
+    printf("    GET  /v1/router            — Strategy engine status\n");
+    printf("    POST /v1/strategy/select   — Change strategy at runtime\n");
+    printf("    POST /v1/backend/select    — Select specific backend\n");
+    printf("    GET  /v1/backend/status    — Full backend report\n");
+    printf("──────────────────────────────────────────────\n");
+    printf("\n  Try it:\n");
+    printf("    curl http://127.0.0.1:%d/v1/router\n", g_port);
+    printf("    curl -X POST http://127.0.0.1:%d/v1/chat/completions \\\n", g_port);
+    printf("      -H \"X-Router-Strategy: cascade\" \\\n");
+    printf("      -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":50}'\n");
+    printf("\n  Quick start: add --quick to skip full benchmark\n");
+    printf("  Press Ctrl+C to stop.\n");
+    printf("──────────────────────────────────────────────\n\n");
+
+    // SIGINT/SIGTERM set keep_running=false; a watchdog thread stops the
+    // server so Ctrl-C / kill actually terminate it (issue #1292).
+    std::thread listener([&]() {
+        if (!svr.listen("127.0.0.1", g_port)) {
+            fprintf(stderr, "Failed to start server on port %d\n", g_port);
+            _exit(1);
+        }
+    });
+    while (keep_running)
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    svr.stop();
+    listener.join();
+
+    // ── Cleanup ──
+    printf("\nShutting down...\n");
+    if (g_watchdog) {
+        g_watchdog->stop();
+        delete g_watchdog;
+        g_watchdog = nullptr;
+    }
+    mgr.destroy();
+    printf("Done.\n");
+    fflush(stdout);
+    fflush(stderr);
+    // Exit WITHOUT static-dtor teardown: the DynamicRouter holds its own
+    // BackendEntry refs, so the 4 backends (HIP, Vulkan, XRT NPU) are actually
+    // destroyed at exit() in the wrong order — reproduced SIGSEGV in the
+    // Vulkan validation layer, and ABRT from XRT "Failed to destroy DRM BO"
+    // (EBADF) bursts in production. _exit() lets the kernel reclaim the GPU
+    // contexts deterministically.
+    _exit(0);
+}

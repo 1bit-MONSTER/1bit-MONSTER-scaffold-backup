@@ -1,0 +1,74 @@
+name: PR Agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: write
+
+jobs:
+  pr_agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Only run for same-repo PRs and trusted commenters (not external forks)
+    if: |
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # needed for gitnexus compare against origin/main
+
+      # GitNexus: build/refresh the local knowledge-graph index (incremental),
+      # then map the PR diff to indexed symbols + affected execution flows.
+      # The report is injected into the review via artifact_path below.
+      # Only on pull_request events: comment-triggered runs have no
+      # pull_request.base.sha for the cache key (PR agent still runs).
+      - name: Cache GitNexus index
+        if: github.event_name == 'pull_request'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: .gitnexus
+          key: gitnexus-${{ github.event.pull_request.base.sha }}
+          restore-keys: |
+            gitnexus-
+
+      - name: GitNexus impact analysis
+        if: github.event_name == 'pull_request'
+        run: |
+          set +e  # GitNexus is context-only; infra hiccups must not block the review
+          npm install -g gitnexus@1.6.9
+          # Register a restored cache index (no-op if absent), then refresh
+          # incrementally. analyze can transiently fail to finalize on fresh
+          # runners — retry once per its own diagnostic.
+          gitnexus index . 2>/dev/null
+          gitnexus analyze || gitnexus analyze
+          gitnexus detect-changes --scope compare --base-ref "origin/${{ github.event.pull_request.base.ref }}" --repo 1bit-systems \
+            > gitnexus-context.md 2>&1
+          echo "--- gitnexus report (first 30 lines) ---"
+          head -30 gitnexus-context.md
+
+      - name: PR Agent
+        uses: The-PR-Agent/pr-agent@570f67ed5fc8db5be74c18df070bc20079b64b0d  # v0.41.0
+        with:
+          artifact_path: gitnexus-context.md
+          artifact_instructions: >
+            This is a GitNexus knowledge-graph analysis of the PR's changed
+            symbols: blast radius (upstream dependants), affected execution
+            flows, and risk level. Use it to prioritize review effort on
+            high-risk changes and to verify the PR's impact claims against
+            the repo's actual call graph.
+        env:
+          OPENAI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          OPENAI_API_BASE: https://api.moonshot.ai/v1
+          # SECURITY: GITHUB_TOKEN with contents:write scope is passed to the
+          # third-party action The-PR-Agent/pr-agent. Mitigation: the job-level
+          # `if` guard above restricts execution to same-repo PRs only;
+          # external forks are never processed. Action pinned to v0.41.0 SHA.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_FILE: .pr_agent.toml

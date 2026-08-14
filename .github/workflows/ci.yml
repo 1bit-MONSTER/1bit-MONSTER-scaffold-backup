@@ -1,0 +1,222 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repo-health:
+    name: Repo health (no absolute symlinks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Check no absolute symlinks tracked in git
+        run: bash scripts/check-no-absolute-symlinks.sh
+
+  cpp:
+    name: C++ (cmake configure + build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: recursive
+      - name: Install build deps + TheRock ROCm
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build build-essential python3 python3-venv \
+            libcurl4-openssl-dev libzstd-dev libwebsockets-dev \
+            libvulkan-dev glslc uuid-dev libdrm-dev spirv-headers  # zinc_cpp (Vulkan) + lockfile (-luuid) + lemonade amdxdna (libdrm) + llama.cpp ggml-vulkan (SPIRV)
+          # XRT (Xilinx Runtime) — backend_fused.cpp/backend_fused_npu.cpp need
+          # xrt headers at compile time (same dep release.yml installs).
+          sudo apt-get install -y -qq libxrt-dev || \
+            echo "::warning::libxrt-dev not available — fused NPU backends stubbed"
+          # TheRock nightly ROCm only (native gfx1151). This repo never falls
+          # back to apt ROCm 7.2.4 — if TheRock can't install, CI fails.
+          sudo python3 -m venv /opt/rocm-therock
+          sudo /opt/rocm-therock/bin/pip install \
+            "rocm[devel,libraries]" \
+            --index-url https://rocm.nightlies.amd.com/whl-multi-arch/
+          sudo /opt/rocm-therock/bin/rocm-sdk init
+      - name: Build llama.cpp ggml-vulkan libs
+        run: |
+          # backend_ggml_vulkan.cpp (in unified_server + onebin) compiles the
+          # real wrapper when llama.h is reachable — the submodule is checked
+          # out on CI — and links libllama/libggml-vulkan. Build them first.
+          cd third_party/llama.cpp
+          # llama-onnx.cpp includes onnxruntime_cxx_api.h unconditionally at
+          # this pin; no onnxruntime package exists for ubuntu-24.04 runners.
+          # The engine doesn't use llama's ONNX path — drop the TU.
+          sed -i '/llama-onnx\.cpp/d' src/CMakeLists.txt
+          cmake -B build -G Ninja -DBUILD_SHARED_LIBS=OFF -DGGML_VULKAN=ON \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF \
+            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF
+          cmake --build build -j8 --target ggml-vulkan llama llama-common
+          ls -la build/ggml/src/ggml-vulkan/libggml-vulkan.a build/src/libllama.a
+      - name: Verify CMakeLists references resolve
+        run: |
+          set -e
+          python3 -<<'PY'
+          import re, pathlib, sys
+          root = pathlib.Path('.')
+          missing = []
+          txt = root.joinpath('CMakeLists.txt').read_text()
+          for m in re.findall(r'add_subdirectory\(\s*([^\s\)\s]+)', txt):
+              if not (root / m / 'CMakeLists.txt').exists():
+                  missing.append(f'add_subdirectory({m}) -> missing CMakeLists.txt')
+          for m in re.findall(r'(?:add_executable|add_library)\((.*?)\)', txt, re.S):
+              for tok in re.findall(r'([A-Za-z0-9_/+.-]+\.(?:cpp|cc|hip|mm|rc))', m):
+                  if not (root / tok).exists():
+                      missing.append(f'source file missing: {tok}')
+          if missing:
+              print('CMakeLists references unresolved files/dirs:')
+              for x in missing: print(' -', x)
+              sys.exit(1)
+          print('All CMakeLists source/subdirectory references resolve.')
+          PY
+      - name: CMake configure + build (reference checks only when no ROCm)
+        run: |
+          if [ -x /opt/rocm-therock/bin/amdclang++ ]; then
+            echo "TheRock detected — full cmake configure + build."
+            cmake -B build -G Ninja -DCMAKE_HIP_ARCHITECTURES=gfx1151
+            # Build the server AND every test_* target so a dropped source or a
+            # compile break fails CI (issue #236).
+            # Also build all new C++ tools to catch compile errors.
+            # zaya_server/onebitd/onebit/unified_router/vision_server are no
+            # longer separate targets — their sources compile into onebin/1bit
+            # only (see CMakeLists.txt). Build onebin instead of listing them.
+            ninja -C build onebin \
+              test_medusa_skeleton test_standalone_nock test_prim_and_attn \
+              test_ternary_gemm_smallm test_sherry_gemv test_bonsai_gemv \
+              test_zaya_moe_gemv test_cca_attn test_wmma_i8_gemv \
+              test_bonsai_e2e test_sherry_e2e test_block_scaled_ternary \
+              test_gguf_reader_dequant test_tokenizer_logprobs test_backend \
+              test_lora_runtime test_auth test_billing \
+              test_voice_session jarvis_ws_proto_test test_npu_flm_delta test_moe_fused_math \
+              ppl_generic gguf_to_onebp vl_logit_check \
+              vl_pipeline_test test_vit_encoder zaya1_vl_demo
+          else
+            echo "ROCm not available on this runner — reference checks only."
+            if [ -f tests/test_medusa_skeleton.cpp ]; then
+              echo "test_medusa_skeleton.cpp exists — monorepo wiring OK."
+            else
+              echo "Missing test_medusa_skeleton.cpp — build wiring broken."
+              exit 1
+            fi
+          fi
+      - name: Run headless tests (ctest -L host)
+        run: |
+          if [ -d build ]; then
+            # test_medusa_skeleton links rocm_cpp (shared) → needs HIP libs at
+            # runtime; the loader can't find them without TheRock on the path.
+            PYTHON_SITE="$(dirname "$(find /opt/rocm-therock/lib -name '_rocm_sdk_devel' -type d 2>/dev/null | head -1)")"
+            if [ -n "$PYTHON_SITE" ]; then
+              export LD_LIBRARY_PATH="$PYTHON_SITE/_rocm_sdk_devel/lib:$PYTHON_SITE/_rocm_sdk_core/lib:$PYTHON_SITE/_rocm_sdk_libraries/lib:${LD_LIBRARY_PATH:-}"
+            fi
+            ctest --test-dir build -L host --output-on-failure
+          else
+            echo "No build/ directory (ROCm unavailable on this runner) - skipping host ctest."
+          fi
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: '.'
+          severity: warning
+          # vendored deps pulled in by the cmake build (mbedtls, cpp_httplib)
+          # ship shell scripts that fail SC warnings — never our code.
+          ignore_paths: 'build _deps third_party packaging'
+
+  lint:
+    name: Lint (clang-format)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: clang-format check (informational)
+        run: |
+          sudo apt-get install -y -qq clang-format
+          find . -name '*.cpp' -o -name '*.h' -o -name '*.hip' -o -name '*.hpp' | \
+            grep -v build/ | grep -v _deps/ | grep -v '.git/' | \
+            xargs clang-format --dry-run --Werror 2>&1 | head -20
+
+  version:
+    name: Version consistency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: All manifests match root VERSION
+        run: bash scripts/sync-version.sh --check
+  smoke-test:
+    name: Inference smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Check download_and_run.sh exists
+        run: |
+          if [ -f tests/download_and_run.sh ]; then
+            echo "✅ tests/download_and_run.sh exists"
+            bash -n tests/download_and_run.sh && echo "  Shell syntax OK"
+          else
+            echo "⚠️  tests/download_and_run.sh not yet written for non-HW runners"
+          fi
+
+  # PPL format gate (issue #1242): the 30-second quality gate that caught the
+  # TQ2 catastrophe (ppl 3.7e8 vs Q4NX 62 vs fp16 21.8). Rebuilds the converter
+  # + harness with plain g++ (CPU-only, no ROCm needed), converts a fresh Q8_0
+  # GGUF to Q4NX 1BP, and asserts the perplexity window on the fixed 48-sample
+  # gate set. Measured locally: Q4NX-from-Q8_0 ppl 16.34; TQ2-of-dense 1.1e8.
+  # A TQ2-class regression (or a corrupt converter/reader) blows the window.
+  ppl-gate:
+    name: PPL format gate (Q8_0 → Q4NX 1BP)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake
+      - name: Build ppl_generic (baseline x86-64 flags — packed path is target-attributed)
+        run: |
+          mkdir -p build
+          g++ -O3 -std=c++23 -fopenmp -I src -I include -I engine/npu/src \
+            research/ws00-baseline/ppl_generic.cpp \
+            src/model_discovery.cpp src/gguf_reader.cpp \
+            src/q4nx_reader.cpp src/safetensors_reader.cpp \
+            -o build/ppl_generic
+      - name: Build gguf_to_onebp
+        run: |
+          g++ -O3 -std=c++23 -I src -I include -I engine/npu/src \
+            tools/gguf_to_onebp.cpp src/gguf_reader.cpp -o build/gguf_to_onebp
+      - name: Download Qwen3-0.6B Q8_0 GGUF (converter source)
+        run: |
+          curl -fL --retry 3 -o qwen3-0.6b-q8_0.gguf \
+            https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
+          ls -la qwen3-0.6b-q8_0.gguf
+      - name: Convert Q8_0 → Q4NX 1BP
+        run: |
+          ./build/gguf_to_onebp qwen3-0.6b-q8_0.gguf qwen3-0.6b-q4nx.1bp
+      - name: Run perplexity gate (assert 10 < ppl < 40)
+        run: |
+          ./build/ppl_generic qwen3-0.6b-q4nx.1bp \
+            research/ws00-baseline/samples/ppl-gate-48.jsonl 4 | tee /tmp/ppl-out.txt
+          PPL=$(grep -oE 'PPL = [0-9.]+' /tmp/ppl-out.txt | grep -oE '[0-9.]+')
+          echo "PPL=$PPL"
+          python3 - <<PY
+          ppl = float("$PPL")
+          assert 10.0 < ppl < 40.0, f"ppl {ppl} outside gate window (10, 40) — quant corruption or pipeline regression"
+          print(f"✅ ppl {ppl} inside gate window")
+          PY

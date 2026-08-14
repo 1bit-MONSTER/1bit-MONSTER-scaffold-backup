@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+ldconfig
+
+echo "1bit.systems v2026.08.04 installed — one binary, NPU + GPU + CPU"
+echo ""
+if [ -e /dev/accel/accel0 ]; then
+    echo "NPU device detected (/dev/accel/accel0)"
+else
+    echo "No NPU device found — GPU/CPU backends still work. For NPU: sudo modprobe amdxdna"
+fi
+echo ""
+echo "Usage: 1bit chat   (or: onebit serve / zaya_server --model <path>)"
+echo "Docs:   https://1bit.systems"
+echo "Source: https://github.com/1bit-systems/1bit-systems"

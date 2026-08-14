@@ -1,0 +1,28 @@
+name: hiero-tunnel-setup
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Diagnose token scopes
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          H="Authorization: Bearer $CF_TOKEN"
+          echo "== token verify =="
+          curl -s -H "$H" "https://api.cloudflare.com/client/v4/user/tokens/verify" | jq -c '.result | {id, status}'
+          echo "== token permissions =="
+          curl -s -H "$H" "https://api.cloudflare.com/client/v4/user/tokens/verify" | jq -c '.result.policies[]? | {groups: [.groups[]?.id], resources: .resources}'
+          echo "== zones visible =="
+          curl -s -H "$H" "https://api.cloudflare.com/client/v4/zones?per_page=50" | jq -c '{success, count: (.result|length), zones: [.result[]?.name], errors}'
+          echo "== accounts visible =="
+          curl -s -H "$H" "https://api.cloudflare.com/client/v4/accounts?per_page=50" | jq -c '{success, count: (.result|length), accts: [.result[]?.name]}'
+          echo "== existing tunnels =="
+          curl -s -H "$H" "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/cfd_tunnel?is_deleted=false" | jq -c '{success, tunnels: [.result[]? | {name, id}], errors}'
