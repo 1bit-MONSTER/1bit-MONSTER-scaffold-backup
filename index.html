@@ -61,11 +61,10 @@
   }
 
   .glyph {
-    font-size: 3.5rem;
-    line-height: 1;
-    margin-bottom: 1.5rem;
-    letter-spacing: 0.4rem;
-    filter: contrast(1) grayscale(1);
+    width: 96px;
+    height: 96px;
+    margin: 0 auto 1.5rem;
+    image-rendering: pixelated;
   }
 
   h1 {
@@ -109,7 +108,7 @@
 </head>
 <body>
 <main>
-  <div class="glyph" aria-hidden="true">▚▞▚▞</div>
+  <img class="glyph" src="/favicon.svg" alt="" aria-hidden="true">
   <h1>1bit MONSTER</h1>
   <p class="tagline">everything is black, white, or about to change.</p>
   <div class="status">signal incoming</div>
